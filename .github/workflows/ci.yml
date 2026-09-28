@@ -24,8 +24,20 @@ jobs:
           xcodebuild test \
             -project TokenBar.xcodeproj -scheme TokenBar \
             -destination 'platform=macOS' -derivedDataPath build \
-            | tee test.log | grep -E "Test run with|error:|\*\* TEST" || true
-          grep -q "TEST SUCCEEDED" test.log
+            | tee test.log | grep -E "Test run with|error:|✘|recorded an issue|\*\* TEST" || true
+          if ! grep -q "TEST SUCCEEDED" test.log; then
+            echo "::group::Fallos detallados"
+            grep -E "✘|recorded an issue|error:" test.log | head -50
+            echo "::endgroup::"
+            exit 1
+          fi
+
+      - name: Guardar el log de tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: test.log
 
       - name: Build Release
         run: |
