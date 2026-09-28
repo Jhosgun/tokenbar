@@ -5,6 +5,7 @@ Requisitos: **macOS 14 (Sonoma) o superior**. Solo hace falta Xcode si la vas a 
 ## 1. Homebrew (recomendado)
 
 ```sh
+brew trust jhosgun/tap          # Homebrew exige confiar en los taps de terceros
 brew install --cask jhosgun/tap/tokenbar
 ```
 
@@ -47,9 +48,6 @@ primera vez macOS dirá que no puede verificar al desarrollador. Dos formas de s
   ```sh
   xattr -dr com.apple.quarantine /Applications/TokenBar.app
   ```
-
-Con Homebrew puedes evitarlo desde el inicio con
-`brew install --cask --no-quarantine jhosgun/tap/tokenbar`.
 
 Esa marca existe para protegerte de binarios descargados de internet, así que sáltatela
 solo con software cuyo origen conozcas. Si prefieres no hacerlo, usa la opción 3 y

@@ -7,6 +7,7 @@ cuota. Nativa y sin dependencias externas.
 ## Instalar
 
 ```sh
+brew trust jhosgun/tap
 brew install --cask jhosgun/tap/tokenbar
 ```
 
