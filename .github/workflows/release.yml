@@ -1,0 +1,67 @@
+name: Release
+
+# Al empujar un tag v* compila, empaqueta y publica el zip con su sha256.
+# No hay firma ni notarización: no hay cuenta de Apple Developer, así que la app va
+# firmada ad-hoc y macOS pedirá confirmación la primera vez (ver docs/INSTALL.md).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode disponible
+        run: |
+          # No se fija una versión concreta: los runners rotan y la ruta cambia.
+          # Basta con que sea 16 o superior, que es lo que pide Swift 6.
+          xcodebuild -version
+          sudo xcode-select -p
+
+      - name: Tests
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project TokenBar.xcodeproj -scheme TokenBar \
+            -destination 'platform=macOS' -derivedDataPath build \
+            | tee test.log | grep -E "Test run with|error:" || true
+          grep -q "TEST SUCCEEDED" test.log
+
+      - name: Empaquetar
+        id: package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          make release VERSION="$VERSION"
+          SHA=$(shasum -a 256 "dist/TokenBar-$VERSION.zip" | cut -d' ' -f1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA"     >> "$GITHUB_OUTPUT"
+
+      - name: Publicar release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TokenBar-${{ steps.package.outputs.version }}.zip
+          body: |
+            ## Instalar
+
+            ```sh
+            brew install --cask jhosgun/tap/tokenbar
+            ```
+
+            O baja el zip de aquí abajo y arrastra `TokenBar.app` a `/Applications`.
+
+            **La app no está notarizada** (no hay cuenta de Apple Developer), así que la
+            primera vez macOS la bloquea. Ábrela con clic derecho → Abrir, o quita la
+            cuarentena:
+
+            ```sh
+            xattr -dr com.apple.quarantine /Applications/TokenBar.app
+            ```
+
+            Si prefieres no confiar en el binario, compílala tú: `make install`.
+
+            `sha256` del zip: `${{ steps.package.outputs.sha256 }}`

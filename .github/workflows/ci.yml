@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode disponible
+        run: |
+          # No se fija una versión concreta: los runners rotan y la ruta cambia.
+          # Basta con que sea 16 o superior, que es lo que pide Swift 6.
+          xcodebuild -version
+          sudo xcode-select -p
+
+      - name: Tests
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project TokenBar.xcodeproj -scheme TokenBar \
+            -destination 'platform=macOS' -derivedDataPath build \
+            | tee test.log | grep -E "Test run with|error:|\*\* TEST" || true
+          grep -q "TEST SUCCEEDED" test.log
+
+      - name: Build Release
+        run: |
+          xcodebuild -project TokenBar.xcodeproj -scheme TokenBar \
+            -configuration Release -derivedDataPath build build | tail -1
