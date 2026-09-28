@@ -1,6 +1,10 @@
 import Foundation
 import OSLog
-import UserNotifications
+// `@preconcurrency`: el SDK de Xcode 26 marca `UNUserNotificationCenter` como `Sendable`,
+// pero el de Xcode 16 —el de los runners de CI— todavía no, y ahí `await center.add(...)`
+// desde el MainActor se rechaza con "sending 'center' risks causing data races". Con esto
+// compila igual en ambos; el acceso real sigue confinado a este actor.
+@preconcurrency import UserNotifications
 
 /// Notifica una vez al día cuando el total de tokens del día supera el umbral configurado.
 @MainActor
