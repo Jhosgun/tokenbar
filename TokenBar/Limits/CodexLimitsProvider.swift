@@ -18,6 +18,8 @@ struct CodexLimitsProvider: LimitsProvider {
     }
 
     static let tailByteLimit: UInt64 = 256 * 1024
+    /// Plazo absoluto para la consulta de red, más allá de `URLRequest.timeoutInterval`.
+    static let fetchBudget: Duration = .seconds(5)
     private static let directoryLimit = 3
     private static let dayLimit = 7
     private static let fileLimit = 8
@@ -39,7 +41,12 @@ struct CodexLimitsProvider: LimitsProvider {
         guard let credential = Self.credential(at: authURL) else {
             return .empty(source, .notConfigured)
         }
+        return await NetworkDeadline.run(budget: Self.fetchBudget) {
+            await self.requestUsage(credential: credential)
+        } ?? fallback(or: .failed("Tiempo de espera agotado"))
+    }
 
+    private func requestUsage(credential: Credential) async -> LimitsSnapshot {
         var request = URLRequest(url: Endpoint.usage)
         request.timeoutInterval = 5
         request.setValue("Bearer \(credential.accessToken)", forHTTPHeaderField: "Authorization")
@@ -54,7 +61,11 @@ struct CodexLimitsProvider: LimitsProvider {
                     if let snapshot = Self.parseUsage(data) { return snapshot }
                     return fallback(or: .failed("Respuesta no reconocida"))
                 case 401, 403:
-                    return fallback(or: .failed("Abre Codex para renovar la sesión"))
+                    // Estado definitivo: hay que reautenticar, así que no tiene sentido
+                    // taparlo con el rollout local.
+                    return .empty(source, .invalidCredentials)
+                case 429:
+                    return rateLimited(retryAfter: RetryAfter.date(from: http))
                 default:
                     return fallback(or: .failed("HTTP \(http.statusCode)"))
                 }
@@ -65,6 +76,18 @@ struct CodexLimitsProvider: LimitsProvider {
             Self.log.error("fallo de red: \(error.localizedDescription, privacy: .public)")
             return fallback(or: .failed("Sin conexión"))
         }
+    }
+
+    /// Un 429 activa el backoff del ViewModel (`rateLimited`), pero conserva las ventanas
+    /// del rollout local si las hay: el endpoint saturado no tiene por qué vaciar la fila.
+    private func rateLimited(retryAfter: Date?) -> LimitsSnapshot {
+        guard var snapshot = Self.latestRolloutSnapshot(in: sessionsURL) else {
+            return .rateLimited(source, retryAfter: retryAfter)
+        }
+        snapshot.status = .failed("Límite de consultas alcanzado")
+        snapshot.rateLimited = true
+        snapshot.rateLimitedUntil = retryAfter
+        return snapshot
     }
 
     private func fallback(or status: CollectorStatus) -> LimitsSnapshot {
@@ -126,43 +149,70 @@ struct CodexLimitsProvider: LimitsProvider {
             parsedWindows.append(contentsOf: windows(from: container, prefix: prefix, seen: &seen))
         }
         guard !parsedWindows.isEmpty else { return nil }
+        // Orden global por duración, la más corta primero: Codex concatena por contenedor
+        // (base, luego cada `additional_rate_limits`), y eso puede dejar una semanal
+        // delante de una 5 horas si al contenedor base le falta esta última.
+        //
+        // `sorted` no está garantizado estable en Swift, así que dos ventanas de la misma
+        // duración (el caso común: la de la cuenta y la de un modelo, ambas de 5 horas)
+        // podrían intercambiar su orden entre corridas. Se desempata por la posición
+        // original para que la de la cuenta —la que se insertó primero— siga mandando
+        // sobre la de un modelo cuando duran lo mismo.
+        let ordered = parsedWindows.enumerated()
+            .sorted { lhs, rhs in
+                lhs.element.minutes != rhs.element.minutes
+                    ? lhs.element.minutes < rhs.element.minutes
+                    : lhs.offset < rhs.offset
+            }
+            .map(\.element.window)
         let label = plan?.trimmingCharacters(in: .whitespacesAndNewlines)
         return LimitsSnapshot(source: .codex,
-                              windows: parsedWindows,
+                              windows: ordered,
                               planLabel: label?.isEmpty == false ? label : nil,
                               status: .ok)
     }
 
     private static func windows(from container: [String: Any],
                                 prefix: String? = nil,
-                                seen: inout Set<String>) -> [LimitWindow] {
+                                seen: inout Set<String>) -> [(window: LimitWindow, minutes: Int)] {
         let keys = ["primary_window", "secondary_window", "primary", "secondary"]
         return keys.compactMap { key in
             guard let value = container[key] as? [String: Any],
-                  let window = window(from: value, prefix: prefix),
-                  seen.insert(window.name).inserted else { return nil }
-            return window
+                  let parsed = window(from: value, prefix: prefix),
+                  seen.insert(parsed.window.name).inserted else { return nil }
+            return parsed
         }
     }
 
-    private static func window(from value: [String: Any], prefix: String?) -> LimitWindow? {
-        guard let used = number(value["used_percent"]), used.isFinite,
+    private static func window(from value: [String: Any],
+                               prefix: String?) -> (window: LimitWindow, minutes: Int)? {
+        guard let used = number(value["used_percent"]),
+              let utilization = LimitWindow.utilization(fromPercent: used),
               let minutes = windowMinutes(from: value) else { return nil }
         let baseName = windowName(minutes: minutes)
-        let name = prefix.map { "\($0) · \(baseName)" } ?? baseName
-        return LimitWindow(name: name,
-                           utilization: used / 100,
-                           resetsAt: resetDate(from: value["reset_at"] ?? value["resets_at"]))
+        // Junto a un modelo el nombre va en minúscula ("Codex Mini semanal"), como ya
+        // hace `ClaudeLimitsProvider` con sus cuotas por modelo ("Fable semanal").
+        let name = prefix.map { "\($0) \(lowercasedFirstLetter(baseName))" } ?? baseName
+        let window = LimitWindow(name: name,
+                                 utilization: utilization,
+                                 resetsAt: resetDate(from: value["reset_at"] ?? value["resets_at"]))
+        return (window, minutes)
+    }
+
+    private static func lowercasedFirstLetter(_ text: String) -> String {
+        guard let first = text.first else { return text }
+        return first.lowercased() + text.dropFirst()
     }
 
     private static func windowMinutes(from value: [String: Any]) -> Int? {
         if let raw = number(value["window_minutes"]), raw.isFinite,
-           raw > 0, raw.rounded() == raw {
-            return Int(raw)
+           raw > 0, raw.rounded() == raw, let minutes = Int(exactly: raw) {
+            return minutes
         }
         if let seconds = number(value["limit_window_seconds"]), seconds.isFinite,
-           seconds > 0, (seconds / 60).rounded() == seconds / 60 {
-            return Int(seconds / 60)
+           seconds > 0, (seconds / 60).rounded() == seconds / 60,
+           let minutes = Int(exactly: seconds / 60) {
+            return minutes
         }
         return nil
     }

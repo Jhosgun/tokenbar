@@ -9,8 +9,11 @@ final class UsageViewModel {
 
     /// Cada cuánto corre el ciclo automático.
     private static let refreshInterval: Duration = .seconds(30)
-    /// Retención de datos históricos.
+    /// Retención del detalle por herramienta.
     private static let retentionDays = 90
+    /// Retención del resumen diario (total por día, sin desglose por herramienta): más
+    /// larga que el detalle porque es lo que sostiene la racha a largo plazo.
+    private static let summaryRetentionDays = 365
     private static let showCostKey = "showCost"
 
     private(set) var snapshot: UsageSnapshot = .empty
@@ -87,7 +90,7 @@ final class UsageViewModel {
             await self.state.load()
             // Una sola poda por arranque; la app es de larga vida pero 90 días de margen
             // hacen que un solo pase al día sea de sobra.
-            await self.store.purge(olderThanDays: Self.retentionDays)
+            await self.store.purge(olderThanDays: Self.retentionDays, summaryDays: Self.summaryRetentionDays)
 
             while !Task.isCancelled {
                 await self.refresh()
@@ -165,7 +168,10 @@ final class UsageViewModel {
         case .ok:
             limits[source] = snapshot
             lastGoodLimits[source] = snapshot
-            lastGoodAt[source] = now
+            // `dataAsOf` es la fecha real del dato (una caché, un CLI que ya corrió);
+            // `now` solo es correcto cuando el proveedor no la informa, es decir, cuando
+            // el dato es genuinamente recién obtenido.
+            lastGoodAt[source] = snapshot.dataAsOf ?? now
             gate.recordAttempt(now: now)
 
         case .notConfigured, .invalidCredentials:
@@ -196,7 +202,10 @@ final class UsageViewModel {
             var good = snapshot
             good.status = .ok
             lastGoodLimits[source] = good
-            lastGoodAt[source] = now
+            // Si el snapshot trae su propia fecha (una caché o un CLI de hace rato), esa
+            // es la antigüedad real: sobrescribir con `now` haría decir "ahora" de un dato
+            // que puede tener minutos.
+            lastGoodAt[source] = snapshot.dataAsOf ?? now
         } else if var good = lastGoodLimits[source], lastGoodAt[source] != nil {
             good.status = snapshot.status
             limits[source] = good

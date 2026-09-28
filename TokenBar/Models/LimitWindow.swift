@@ -43,6 +43,43 @@ struct LimitWindow: Identifiable, Hashable, Sendable {
         }
         return hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m"
     }
+
+    /// Convierte un porcentaje en la escala 0…100 (la que informan casi todos los
+    /// proveedores) a una fracción 0…1. Fuera de ese rango el dato es imposible —nadie
+    /// puede llevar consumido un 130%, ni un -5%— así que se rechaza en vez de acotarlo:
+    /// acotarlo mostraría una cifra inventada en vez de fallar suave.
+    static func utilization(fromPercent percent: Double) -> Double? {
+        guard percent.isFinite, percent >= 0, percent <= 100 else { return nil }
+        return percent / 100
+    }
+
+    /// Convierte un cociente usado/tope en una fracción 0…1. A diferencia del porcentaje,
+    /// pasarse del tope sí describe un estado real (sobreconsumo, créditos extra…): se
+    /// satura a 1 en vez de rechazarse.
+    static func utilization(used: Double, cap: Double) -> Double? {
+        guard used.isFinite, cap.isFinite, used >= 0, cap > 0 else { return nil }
+        return min(used / cap, 1)
+    }
+}
+
+/// Parsea el header `Retry-After` de una respuesta 429. Compartido por los seis
+/// proveedores: todos activan el mismo backoff del `UsageViewModel` ante un límite de
+/// consultas, no solo Claude.
+enum RetryAfter {
+    /// Acepta tanto delta-segundos (`60`) como fecha HTTP
+    /// (`Wed, 21 Oct 2015 07:28:00 GMT`). `nil` si el servidor no lo informó.
+    static func date(from response: HTTPURLResponse, now: Date = Date()) -> Date? {
+        guard let value = response.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        if let seconds = Double(value), seconds.isFinite {
+            return now.addingTimeInterval(max(0, seconds))
+        }
+        let rfc1123 = DateFormatter()
+        rfc1123.locale = Locale(identifier: "en_US_POSIX")
+        rfc1123.timeZone = TimeZone(secondsFromGMT: 0)
+        rfc1123.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return rfc1123.date(from: value)
+    }
 }
 
 /// Lo que un proveedor de límites sabe de una cuenta en un momento dado.
@@ -58,6 +95,11 @@ struct LimitsSnapshot: Equatable, Sendable {
     var rateLimited: Bool = false
     /// Si `rateLimited` y el servidor informó `Retry-After`, hora mínima de reintento.
     var rateLimitedUntil: Date? = nil
+    /// Cuándo se originó el dato (no cuándo se consultó al proveedor): la fecha de una
+    /// caché local, o de la última corrida de un CLI cuyo resultado se reutiliza. `nil`
+    /// significa "recién obtenido" — el caso normal de una consulta de red exitosa, donde
+    /// el momento de la consulta y el del dato coinciden.
+    var dataAsOf: Date? = nil
 
     static func empty(_ source: AppSource, _ status: CollectorStatus) -> LimitsSnapshot {
         LimitsSnapshot(source: source, windows: [], planLabel: nil, status: status)

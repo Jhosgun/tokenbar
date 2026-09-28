@@ -91,45 +91,19 @@ struct AntigravityLimitsProvider: LimitsProvider {
 
         // La ejecución vive en su propia tarea: si se pasa del presupuesto, `fetch()`
         // devuelve lo último conocido y la tarea sigue, guardando su resultado para el
-        // ciclo siguiente.
-        let work = Task.detached(priority: .utility) { [run, cache] in
+        // ciclo siguiente. `NetworkDeadline` no espera a `work` si se pasa del plazo —ver
+        // su doc— así que esto no bloquea aunque el CLI tarde de más.
+        //
+        // `cancelOnTimeout: false`: a diferencia de una petición de red, este CLI ya
+        // consumió los segundos que tardó en arrancar. Cancelarlo tiraría ese trabajo y el
+        // ciclo siguiente volvería a pagarlo entero; dejarlo correr aprovecha el resultado
+        // en cuanto llegue, vía la caché.
+        _ = await NetworkDeadline.run(budget: budget, cancelOnTimeout: false) { [run, cache] in
             await cache.store(Self.snapshot(from: await run(binary)), at: Date())
         }
-        await Self.wait(for: work, upTo: budget)
 
         return await cache.current(now: Date())
             ?? .empty(source, .failed("Consultando la cuota…"))
-    }
-
-    /// Espera a la tarea, pero no más de `budget`. No la cancela al vencer: el CLI ya está
-    /// corriendo y su resultado sirve igual para el ciclo siguiente.
-    ///
-    /// No se usa un `TaskGroup`: al salir espera a todos sus hijos, así que el que aguarda
-    /// al CLI mantendría el bloqueo aunque venza el presupuesto. Con dos tareas sueltas y
-    /// una compuerta que solo reanuda una vez, la espera se abandona de verdad.
-    private static func wait(for work: Task<Void, Never>, upTo budget: Duration) async {
-        let gate = FirstResume()
-        await withCheckedContinuation { continuation in
-            Task {
-                await work.value
-                await gate.resume(continuation)
-            }
-            Task {
-                try? await Task.sleep(for: budget)
-                await gate.resume(continuation)
-            }
-        }
-    }
-
-    /// Reanuda un continuation una sola vez, gane quien gane la carrera.
-    private actor FirstResume {
-        private var resumed = false
-
-        func resume(_ continuation: CheckedContinuation<Void, Never>) {
-            guard !resumed else { return }
-            resumed = true
-            continuation.resume()
-        }
     }
 
     // MARK: - Binario
@@ -190,10 +164,10 @@ struct AntigravityLimitsProvider: LimitsProvider {
             return window
         }
         guard !windows.isEmpty else { return nil }
-        // Las de 5 h primero: la fila plegada muestra la primera, y es la que decide si
-        // puedes seguir trabajando ahora. El CLI las imprime al revés.
-        let ordered = windows.filter { $0.name.hasSuffix("5 h") }
-            + windows.filter { !$0.name.hasSuffix("5 h") }
+        // Las de 5 horas primero: la fila plegada muestra la primera, y es la que decide
+        // si puedes seguir trabajando ahora. El CLI las imprime al revés.
+        let ordered = windows.filter { $0.name.hasSuffix("5 horas") }
+            + windows.filter { !$0.name.hasSuffix("5 horas") }
         return LimitsSnapshot(source: .antigravity, windows: ordered, planLabel: nil, status: .ok)
     }
 
@@ -206,9 +180,10 @@ struct AntigravityLimitsProvider: LimitsProvider {
         guard fields.count >= 3,
               let group = groupLabel(fields[0]),
               let window = windowLabel(fields[1]),
-              let remaining = remainingPercent(fields[2]) else { return nil }
+              let remaining = remainingPercent(fields[2]),
+              let utilization = LimitWindow.utilization(fromPercent: 100 - remaining) else { return nil }
         return LimitWindow(name: "\(group) \(window)",
-                           utilization: 1 - remaining / 100,
+                           utilization: utilization,
                            resetsAt: fields.count >= 4 ? resetDate(fields[3]) : nil)
     }
 
@@ -220,21 +195,22 @@ struct AntigravityLimitsProvider: LimitsProvider {
         return nil
     }
 
-    /// "Five Hour Limit Remaining" → "5 h"; "Weekly Limit Remaining" → "semanal".
+    /// "Five Hour Limit Remaining" → "5 horas"; "Weekly Limit Remaining" → "semanal".
     static func windowLabel(_ field: String) -> String? {
         let normalized = field.lowercased().replacing("-", with: " ")
-        if normalized.contains("five hour") || normalized.contains("5 hour") { return "5 h" }
+        if normalized.contains("five hour") || normalized.contains("5 hour") { return "5 horas" }
         if normalized.contains("weekly") { return "semanal" }
         return nil
     }
 
-    /// "100%" → 100. Se acota a 0…100 para que la utilización nunca salga de 0…1.
+    /// "100%" → 100. Fuera de 0…100 el dato es imposible (nadie tiene un "130% restante")
+    /// y se rechaza en vez de acotarse: acotarlo inventaría un usado que no es real.
     static func remainingPercent(_ field: String) -> Double? {
         var text = field
         if text.hasSuffix("%") { text.removeLast() }
         guard let value = Double(text.trimmingCharacters(in: .whitespaces)),
-              value.isFinite, value >= 0 else { return nil }
-        return min(value, 100)
+              value.isFinite, value >= 0, value <= 100 else { return nil }
+        return value
     }
 
     /// El reset llega en ISO-8601 ("2026-10-04T23:18:52Z"), con o sin fracciones de segundo.
@@ -308,6 +284,7 @@ struct AntigravityLimitsProvider: LimitsProvider {
                   let lastGood else { return lastResult }
             var marked = lastGood.snapshot
             marked.status = .failed(AntigravityLimitsProvider.ago(now.timeIntervalSince(lastGood.at)))
+            marked.dataAsOf = lastGood.at
             return marked
         }
     }

@@ -739,6 +739,55 @@ struct ClaudeCodeCollectorTests {
         #expect(cycle3.records.isEmpty)
     }
 
+    @Test("un ciclo cortado por presupuesto no poda cursores; uno completo sí")
+    func cicloCortadoNoPodaPeroUnoCompletoSi() async throws {
+        let root = makeTemporaryDirectory()
+        let stateDirectory = makeTemporaryDirectory()
+        defer {
+            removeDirectory(root)
+            removeDirectory(stateDirectory)
+        }
+        try writeTranscript("{}\n", in: root, project: "uno", modified: Date())
+        try writeTranscript("{}\n", in: root, project: "dos", modified: Date())
+
+        // Cursor "huérfano": apunta a un archivo que ya no existe en disco.
+        let stalePath = root.appending(path: "borrado/fantasma.jsonl").path
+        let legacy: [String: Any] = [
+            "version": 2,
+            "bootstrapped": ["claudeCode"],
+            "cursors": [stalePath: [
+                "offset": 10, "size": 10,
+                "modified": ISO8601DateFormatter().string(from: Date())
+            ]],
+            "seenMessageIDs": [],
+            "claudeMessages": []
+        ]
+        try JSONSerialization.data(withJSONObject: legacy)
+            .write(to: stateDirectory.appending(path: "state.json"))
+
+        // Ciclo con presupuesto agotado: no alcanza a recorrer todo el árbol (dos archivos).
+        let truncatedState = CollectorStateStore(directory: stateDirectory)
+        await truncatedState.load()
+        #expect(await truncatedState.cursor(forPath: stalePath) != nil)
+        let truncatedCollector = ClaudeCodeCollector(
+            rootDirectory: root, store: truncatedState,
+            limits: .init(timeBudget: .zero, maxBytes: 1_024 * 1_024, maxFiles: 10)
+        )
+        _ = await truncatedCollector.collect()
+        await truncatedState.save()
+        #expect(await truncatedState.cursor(forPath: stalePath) != nil,
+                "un ciclo cortado por presupuesto no debe podar cursores de archivos que no visitó")
+
+        // Con presupuesto normal, un recorrido completo sí poda el cursor huérfano.
+        let fullState = CollectorStateStore(directory: stateDirectory)
+        await fullState.load()
+        let fullCollector = ClaudeCodeCollector(rootDirectory: root, store: fullState)
+        _ = await fullCollector.collect()
+        await fullState.save()
+        #expect(await fullState.cursor(forPath: stalePath) == nil,
+                "un recorrido completo debe podar cursores de archivos borrados")
+    }
+
     @Test("acepta timestamps con y sin fracciones y omite los inválidos")
     func formatosDeTimestamp() async throws {
         let harness = makeHarness()

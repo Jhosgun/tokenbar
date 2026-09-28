@@ -329,4 +329,265 @@ struct UsageStoreTests {
         #expect(record.outputTokens == 1)
         #expect(approxEqual(record.costUSD, 0.75))
     }
+
+    // MARK: - Migración (dailyTotals / bestStreak)
+
+    @Test("un usage.json del formato viejo (sin dailyTotals ni bestStreak) carga sin perder datos ni recontar")
+    func migracionDesdeFormatoViejo() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        let today = DayKey.today()
+        let yesterday = try dayKey(daysAgo: 1)
+        // Formato de antes de la racha: solo "version" y "records", sin dailyTotals ni
+        // bestStreak. Dos apps distintas el mismo día para probar que se suman al agregar.
+        let oldFormat = """
+        {"version":1,"records":[\
+        {"source":"claudeCode","day":"\(today)","inputTokens":10,"outputTokens":0,\
+        "cacheCreationTokens":0,"cacheReadTokens":0,"costUSD":0},\
+        {"source":"cursor","day":"\(today)","inputTokens":5,"outputTokens":0,\
+        "cacheCreationTokens":0,"cacheReadTokens":0,"costUSD":0},\
+        {"source":"claudeCode","day":"\(yesterday)","inputTokens":7,"outputTokens":0,\
+        "cacheCreationTokens":0,"cacheReadTokens":0,"costUSD":0}]}
+        """
+        try Data(oldFormat.utf8).write(to: usageFileURL(in: directory))
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+
+        // No se pierde el detalle por herramienta.
+        let snapshot = await store.snapshot()
+        #expect(snapshot.todayByApp[.claudeCode]?.inputTokens == 10)
+        #expect(snapshot.todayByApp[.cursor]?.inputTokens == 5)
+        #expect(snapshot.todayTotalTokens == 15)
+
+        // La racha se reconstruye a partir del detalle: hoy (15 tokens) y ayer (7) están
+        // activos, así que la racha actual es de 2 días, sin necesidad de recontar nada.
+        #expect(snapshot.currentStreak == 2)
+        #expect(snapshot.bestStreak == 2)
+
+        // Y queda persistido: un store nuevo sobre el mismo archivo ve lo mismo sin volver
+        // a agregar (si recontara, el total de hoy dejaría de ser 15).
+        let reopened = UsageStore(directory: directory)
+        await reopened.load()
+        let restored = await reopened.snapshot()
+        #expect(restored.todayTotalTokens == 15)
+        #expect(restored.currentStreak == 2)
+    }
+
+    @Test("un usage.json ya en el formato nuevo respeta dailyTotals y bestStreak tal cual")
+    func cargaFormatoNuevoTalCual() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        let today = DayKey.today()
+        let payload = """
+        {"version":1,"records":[\
+        {"source":"claudeCode","day":"\(today)","inputTokens":10,"outputTokens":0,\
+        "cacheCreationTokens":0,"cacheReadTokens":0,"costUSD":0}],\
+        "dailyTotals":{"\(today)":10},"bestStreak":42}
+        """
+        try Data(payload.utf8).write(to: usageFileURL(in: directory))
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+        let snapshot = await store.snapshot()
+
+        // bestStreak persistido (42) es mayor que la racha actual real (1): se respeta el
+        // valor guardado en vez de recalcularlo desde cero.
+        #expect(snapshot.bestStreak == 42)
+        #expect(snapshot.currentStreak == 1)
+    }
+
+    // MARK: - Racha persistida
+
+    @Test("bestStreak crece con la racha y sobrevive a un round-trip de disco")
+    func bestStreakCreceYPersiste() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+
+        // Tres días consecutivos, aplicados como si el usuario hubiera usado la app cada día.
+        for offset in stride(from: 2, through: 0, by: -1) {
+            let day = try dayKey(daysAgo: offset)
+            await store.apply([UsageRecord(source: .claudeCode, day: day, inputTokens: 1)])
+        }
+
+        let snapshot = await store.snapshot()
+        #expect(snapshot.currentStreak == 3)
+        #expect(snapshot.bestStreak == 3)
+
+        let reopened = UsageStore(directory: directory)
+        await reopened.load()
+        let restored = await reopened.snapshot()
+        #expect(restored.bestStreak == 3)
+    }
+
+    @Test("una racha vieja sin actividad reciente queda como mejor marca, no en 0")
+    func mejorRachaHistoricaSinActividadReciente() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        // Racha de 5 días que terminó hace tiempo; nada ni hoy ni ayer. Formato viejo (sin
+        // dailyTotals ni bestStreak) para forzar la reconstrucción en la migración: si
+        // `bestStreak` solo mirara la racha vigente (anclada a hoy/ayer), esto quedaría en 0.
+        let days = try (10...14).map { try dayKey(daysAgo: $0) }
+        let recordsJSON = days.map {
+            """
+            {"source":"claudeCode","day":"\($0)","inputTokens":1,"outputTokens":0,\
+            "cacheCreationTokens":0,"cacheReadTokens":0,"costUSD":0}
+            """
+        }.joined(separator: ",")
+        try Data("{\"version\":1,\"records\":[\(recordsJSON)]}".utf8)
+            .write(to: usageFileURL(in: directory))
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+        let snapshot = await store.snapshot()
+
+        #expect(snapshot.currentStreak == 0)
+        #expect(snapshot.bestStreak == 5)
+    }
+
+    @Test("un dailyTotals con solo claves inválidas no fabrica una mejor racha de 1")
+    func dailyTotalsConClaveInvalidaNoFabricaRacha() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        // "2026-02-31" no es una fecha real (un `usage.json` dañado a mano, por ejemplo).
+        // Sin filtrar la clave antes de contar, esto se persistiría como bestStreak = 1
+        // aunque nunca hubo racha.
+        let payload = """
+        {"version":1,"records":[],"dailyTotals":{"2026-02-31":5},"bestStreak":0}
+        """
+        try Data(payload.utf8).write(to: usageFileURL(in: directory))
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+        let snapshot = await store.snapshot()
+        #expect(snapshot.bestStreak == 0)
+
+        // Y no queda persistida una cifra inventada: un store nuevo sobre el mismo archivo
+        // también ve 0.
+        let reopened = UsageStore(directory: directory)
+        await reopened.load()
+        let restored = await reopened.snapshot()
+        #expect(restored.bestStreak == 0)
+    }
+
+    @Test("bestStreak no baja aunque la racha actual esté rota")
+    func bestStreakNoBaja() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        // Racha vieja de 5 días guardada en el archivo; ni hoy ni ayer tienen consumo, así
+        // que la racha actual es 0. La mejor marca no debe bajar con eso.
+        let old = try dayKey(daysAgo: 10)
+        let payload = """
+        {"version":1,"records":[],"dailyTotals":{"\(old)":1},"bestStreak":5}
+        """
+        try Data(payload.utf8).write(to: usageFileURL(in: directory))
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+        let snapshot = await store.snapshot()
+
+        #expect(snapshot.currentStreak == 0)
+        #expect(snapshot.bestStreak == 5)
+    }
+
+    // MARK: - Retención separada (detalle vs. resumen diario)
+
+    @Test("purge borra el detalle a los 90 días pero conserva el resumen diario hasta 365")
+    func retencionSeparadaDeResumen() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+
+        let today = DayKey.today()
+        let midRange = try dayKey(daysAgo: 200)   // pasa el detalle (90), no el resumen (365)
+        let veryOld = try dayKey(daysAgo: 400)    // pasa ambos
+
+        await store.apply([
+            UsageRecord(source: .claudeCode, day: today, inputTokens: 1),
+            UsageRecord(source: .claudeCode, day: midRange, inputTokens: 2),
+            UsageRecord(source: .claudeCode, day: veryOld, inputTokens: 3)
+        ])
+
+        await store.purge(olderThanDays: 90, summaryDays: 365)
+
+        // El detalle por herramienta ya no tiene el registro de hace 200 días.
+        let payload = try readUsageFile(in: directory)
+        #expect(Set(payload.records.map(\.day)) == [today])
+
+        // El resumen diario sobrevive esos 200 días (< 365) aunque el detalle ya no esté;
+        // el de hace 400 sí se fue, por pasar también la ventana larga. `todayTotalTokens`
+        // (que sale del detalle) sigue siendo correcto para lo que no se purgó.
+        let reopened = UsageStore(directory: directory)
+        await reopened.load()
+        let snapshot = await reopened.snapshot()
+        #expect(snapshot.todayTotalTokens == 1)
+    }
+
+    @Test("purge sin summaryDays sigue purgando ambos con la misma ventana (compatibilidad)")
+    func purgeSinSummaryDaysUsaLaMismaVentana() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+
+        let today = DayKey.today()
+        let old = try dayKey(daysAgo: 100)
+        await store.apply([
+            UsageRecord(source: .claudeCode, day: today, inputTokens: 1),
+            UsageRecord(source: .claudeCode, day: old, inputTokens: 2)
+        ])
+
+        await store.purge(olderThanDays: 90)
+
+        let payload = try readUsageFile(in: directory)
+        #expect(Set(payload.records.map(\.day)) == [today])
+    }
+
+    // MARK: - Agregación semanal (UsageSnapshot.weekTotals)
+
+    @Test("weekTotals suma todas las apps por día y weekAverage promedia sobre 7 días")
+    func agregacionSemanal() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { removeDirectory(directory) }
+
+        let store = UsageStore(directory: directory)
+        await store.load()
+
+        let today = DayKey.today()
+        await store.apply([
+            UsageRecord(source: .claudeCode, day: today, inputTokens: 10),
+            UsageRecord(source: .cursor, day: today, inputTokens: 20)
+        ])
+
+        let snapshot = await store.snapshot()
+        let week = snapshot.weekTotals
+        #expect(week.count == 7)
+        #expect(week.last?.day == today)
+        #expect(week.last?.tokens == 30)
+        #expect(week.dropLast().allSatisfy { $0.tokens == 0 })
+
+        #expect(snapshot.weekTotalTokens == 30)
+        #expect(snapshot.weekAverageTokens == 30 / 7)
+    }
+
+    @Test("UsageSnapshot.empty trae racha en cero y semana en cero")
+    func snapshotVacioTraeRachaYSemanaEnCero() {
+        let snapshot = UsageSnapshot.empty
+        #expect(snapshot.currentStreak == 0)
+        #expect(snapshot.bestStreak == 0)
+        #expect(snapshot.weekTotalTokens == 0)
+        #expect(snapshot.weekAverageTokens == 0)
+        #expect(snapshot.weekTotals.allSatisfy { $0.tokens == 0 })
+    }
 }

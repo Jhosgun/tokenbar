@@ -185,10 +185,24 @@ struct OpenCodeGoLimitsProviderTests {
         }
     }
 
+    @Test("un 429 activa el backoff del ViewModel")
+    func rateLimited() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        StubURLProtocol.setHandler { _ in (429, Data()) }
+        let snapshot = await harness.provider().fetch()
+        #expect(snapshot.rateLimited)
+        #expect(snapshot.status == .failed("Límite de consultas alcanzado"))
+        #expect(snapshot.windows.isEmpty)
+    }
+
     @Test("formatos desconocidos y cifras inválidas fallan suavemente")
     func formatoDesconocido() async throws {
         for body in ["sin objeto", "{ rolling: { usagePercent: 10 } }",
-                     #"{"rolling":{"usagePercent":-1,"resetInSec":60}}"#] {
+                     #"{"rolling":{"usagePercent":-1,"resetInSec":60}}"#,
+                     // Un porcentaje por encima de 100 es un dato imposible: se rechaza en
+                     // vez de acotarlo a un usado inventado.
+                     #"{"rolling":{"usagePercent":130,"resetInSec":60}}"#] {
             #expect(OpenCodeGoLimitsProvider.parse(Data(body.utf8), now: Date()) == nil)
         }
 

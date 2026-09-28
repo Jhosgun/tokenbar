@@ -114,6 +114,24 @@ struct CommandCodeLimitsProviderTests {
         #expect(snapshot.windows[2].resetsAt == Date(timeIntervalSince1970: 1_790_812_800))
     }
 
+    @Test("un usado por encima del tope se satura a 1, no se descarta")
+    func usadoPorEncimaDelTopeSatura() throws {
+        // Un tope excedido sí describe un estado real (sobreconsumo): la ventana se
+        // muestra al 100%, no se rechaza como pasaría con un porcentaje imposible.
+        let credits = """
+        {"credits":{"planId":"pro","monthlyCredits":760},
+         "windowLimits":{"limited":true,
+          "fiveHour":{"used":150,"cap":100},"weekly":{"used":60,"cap":200}}}
+        """
+        let snapshot = try #require(CommandCodeLimitsProvider.parse(
+            creditsData: Data(credits.utf8),
+            subscriptionsData: Data(Self.subscriptions.utf8),
+            summaryData: Data(Self.summary.utf8)))
+        let fiveHour = try #require(snapshot.windows.first { $0.name == "5 horas" })
+        #expect(fiveHour.utilization == 1)
+        #expect(fiveHour.percent == 100)
+    }
+
     @Test("omite ventanas con cap cero o nulo")
     func omiteCapsInvalidos() throws {
         let credits = """
@@ -239,6 +257,20 @@ struct CommandCodeLimitsProviderTests {
             #expect(snapshot.status == .invalidCredentials)
             #expect(snapshot.windows.isEmpty)
         }
+    }
+
+    @Test("un 429 activa el backoff del ViewModel")
+    func rateLimited() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        StubURLProtocol.setHandler { request in
+            if request.url?.path == "/alpha/whoami" { return (200, Data(Self.whoami.utf8)) }
+            return (429, Data())
+        }
+        let snapshot = await harness.provider().fetch()
+        #expect(snapshot.rateLimited)
+        #expect(snapshot.status == .failed("Límite de consultas alcanzado"))
+        #expect(snapshot.windows.isEmpty)
     }
 
     @Test("formatos desconocidos fallan suavemente")

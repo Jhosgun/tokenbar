@@ -50,9 +50,9 @@ struct AntigravityLimitsProviderTests {
         #expect(snapshot.source == .antigravity)
         #expect(snapshot.status == .ok)
         #expect(snapshot.planLabel == nil)
-        // Las de 5 h van primero: la fila plegada muestra la primera.
+        // Las de 5 horas van primero: la fila plegada muestra la primera.
         #expect(snapshot.windows.map(\.name)
-            == ["Gemini 5 h", "Claude/GPT 5 h", "Gemini semanal", "Claude/GPT semanal"])
+            == ["Gemini 5 horas", "Claude/GPT 5 horas", "Gemini semanal", "Claude/GPT semanal"])
         // 100% restante → nada usado.
         #expect(snapshot.windows.allSatisfy { $0.utilization == 0 })
         #expect(snapshot.windows[0].resetsAt == Date(timeIntervalSince1970: 1_790_569_132))
@@ -72,10 +72,10 @@ struct AntigravityLimitsProviderTests {
             "Gemini Models\tFive Hour Limit Remaining\t0%\t2026-09-28T04:18:52Z"))
         #expect(agotada.windows[0].utilization == 1)
 
-        // Por encima de 100 se acota: la utilización no baja de 0.
-        let acotada = try #require(AntigravityLimitsProvider.parse(
-            "Gemini Models\tFive Hour Limit Remaining\t130%\t2026-10-04T23:18:52Z"))
-        #expect(acotada.windows[0].utilization == 0)
+        // Por encima de 100 es un dato imposible (nadie tiene un "130% restante"): se
+        // rechaza en vez de acotarse a un 0% usado inventado.
+        #expect(AntigravityLimitsProvider.parse(
+            "Gemini Models\tFive Hour Limit Remaining\t130%\t2026-10-04T23:18:52Z") == nil)
     }
 
     @Test("tolera líneas de más, desconocidas o repetidas, y una fecha ilegible no tira la línea")
@@ -106,7 +106,7 @@ struct AntigravityLimitsProviderTests {
         Gemini Models\tWeekly Limit Remaining\tXX%\t2026-10-04T23:18:52Z
         Gemini Models\tFive Hour Limit Remaining\t45%\t2026-09-28T04:18:52Z
         """
-        #expect(AntigravityLimitsProvider.parse(mixta)?.windows.map(\.name) == ["Gemini 5 h"])
+        #expect(AntigravityLimitsProvider.parse(mixta)?.windows.map(\.name) == ["Gemini 5 horas"])
     }
 
     // MARK: - Interpretación de la salida cruda
@@ -195,6 +195,9 @@ struct AntigravityLimitsProviderTests {
         #expect(marcado.windows.count == 4)
         // La edad real es ~0 s, así que la marca es "ahora".
         #expect(marcado.status == .failed("ahora"))
+        // `dataAsOf` lleva la fecha real del último dato bueno, no la del intento fallido:
+        // así el ViewModel no la sobrescribe con "ahora" cuando en realidad es vieja.
+        #expect(marcado.dataAsOf != nil)
     }
 
     // MARK: - Búsqueda del binario

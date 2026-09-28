@@ -44,6 +44,10 @@ struct DashboardView: View {
                             isExpanded: expansion(for: source)
                         )
                     }
+
+                    Divider()
+
+                    WeekSummaryView(snapshot: viewModel.snapshot)
                 }
             }
 

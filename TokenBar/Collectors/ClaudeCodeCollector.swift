@@ -65,6 +65,8 @@ struct ClaudeCodeCollector: UsageCollector {
         }
 
         let bootstrapped = await store.hasBootstrapped(source)
+        var visitedPaths: Set<String> = []
+
         let now = Date()
         let todayKey = DayKey.string(from: now)
         let calendar = Calendar.current
@@ -78,27 +80,36 @@ struct ClaudeCodeCollector: UsageCollector {
         var bytesRead = 0
         var completedScan = true
 
-        for url in transcriptURLs() {
+        let files = TranscriptEnumerator(rootDirectory: rootDirectory, logger: logger)
+        for entry in files {
             if filesScanned > 0, shouldStop(clock: clock, deadline: deadline) {
                 completedScan = false
                 break
             }
             filesScanned += 1
-            guard let stats = fileStats(for: url) else {
+
+            guard case .file(let file) = entry else {
                 filesFailed += 1
+                // No se pudo determinar si el archivo sigue existiendo: se marca como visto
+                // para que un recorrido completo no pode su cursor por error.
+                if case .failed(let url) = entry {
+                    visitedPaths.insert(url.path)
+                }
                 continue
             }
-            let path = url.path
+
+            let path = file.url.path
+            visitedPaths.insert(path)
             let cursor = await store.cursor(forPath: path)
 
-            if let cursor, cursor.offset >= stats.size, cursor.size == stats.size,
-               abs(cursor.modified.timeIntervalSince(stats.modified)) < 1 {
+            if let cursor, cursor.offset >= file.size, cursor.size == file.size,
+               abs(cursor.modified.timeIntervalSince(file.modified)) < 1 {
                 continue
             }
 
-            if !bootstrapped, !calendar.isDate(stats.modified, inSameDayAs: now) {
+            if !bootstrapped, !calendar.isDate(file.modified, inSameDayAs: now) {
                 await store.setCursor(
-                    FileCursor(offset: stats.size, size: stats.size, modified: stats.modified),
+                    FileCursor(offset: file.size, size: file.size, modified: file.modified),
                     forPath: path
                 )
                 continue
@@ -110,12 +121,12 @@ struct ClaudeCodeCollector: UsageCollector {
             }
 
             var offset = cursor?.offset ?? 0
-            if stats.size < offset {
+            if file.size < offset {
                 offset = 0
             }
 
             let remainingBytes = limits.maxBytes - bytesRead
-            guard let chunk = readNewBytes(at: url, from: offset, maximumBytes: remainingBytes) else {
+            guard let chunk = readNewBytes(at: file.url, from: offset, maximumBytes: remainingBytes) else {
                 filesFailed += 1
                 continue
             }
@@ -145,8 +156,8 @@ struct ClaudeCodeCollector: UsageCollector {
 
             await store.setCursor(
                 FileCursor(offset: offset + consumedBytes,
-                           size: stats.size,
-                           modified: stats.modified),
+                           size: file.size,
+                           modified: file.modified),
                 forPath: path
             )
 
@@ -154,14 +165,26 @@ struct ClaudeCodeCollector: UsageCollector {
                 completedScan = false
                 break
             }
-            if offset + consumedBytes < stats.size {
+            if offset + consumedBytes < file.size {
                 completedScan = false
                 break
             }
         }
 
+        // Un recorrido cortado por cancelación (no por presupuesto) tampoco es un recorrido
+        // completo: no debe disparar la poda de cursores ni marcar el bootstrap como hecho.
+        if files.stoppedEarly {
+            completedScan = false
+        }
+
         if !bootstrapped, completedScan {
             await store.setBootstrapped(source)
+        }
+        // La poda de cursores huérfanos solo corre tras un recorrido COMPLETO: nunca sobre un
+        // ciclo cortado por presupuesto o cancelación, para no perder el cursor de un archivo
+        // que simplemente no se llegó a visitar este turno.
+        if completedScan {
+            await store.pruneCursors(keeping: visitedPaths)
         }
 
         let elapsed = clock.now - started
@@ -188,35 +211,66 @@ struct ClaudeCodeCollector: UsageCollector {
 
     // MARK: - Enumeración de archivos
 
-    private func transcriptURLs() -> [URL] {
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey]
-        guard let enumerator = FileManager.default.enumerator(
-            at: rootDirectory,
-            includingPropertiesForKeys: keys,
-            options: [.skipsPackageDescendants, .skipsHiddenFiles]
-        ) else {
-            logger.error("no se pudo enumerar \(rootDirectory.path, privacy: .public)")
-            return []
-        }
-
-        var urls: [URL] = []
-        for case let url as URL in enumerator {
-            if Task.isCancelled { break }
-            guard url.pathExtension == "jsonl" else { continue }
-            let values = try? url.resourceValues(forKeys: Set(keys))
-            guard values?.isSymbolicLink != true, values?.isRegularFile == true else { continue }
-            urls.append(url)
-        }
-        return urls
+    private struct TranscriptFile {
+        let url: URL
+        let size: UInt64
+        let modified: Date
     }
 
-    private func fileStats(for url: URL) -> (size: UInt64, modified: Date)? {
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
-              let size = values.fileSize,
-              let modified = values.contentModificationDate else {
+    private enum TranscriptEntry {
+        case file(TranscriptFile)
+        /// Se encontró un `.jsonl` regular pero no se pudieron leer sus claves de recurso
+        /// (por ejemplo, se borró entre que se listó y se consultó).
+        case failed(URL)
+    }
+
+    /// Recorre el árbol de forma perezosa: cada `next()` avanza un paso y pide las cuatro claves
+    /// de recurso (regular/symlink/tamaño/fecha) en una sola pasada, en vez de enumerar el árbol
+    /// completo primero y volver a pedir tamaño y fecha archivo por archivo. Como quien consume
+    /// la secuencia (`collect()`) comprueba el presupuesto en cada iteración, dejar de pedir
+    /// `next()` también detiene el recorrido: no se paga el costo de estadísticas de archivos
+    /// que el presupuesto ya no alcanza a procesar.
+    private final class TranscriptEnumerator: Sequence, IteratorProtocol {
+        private static let keys: [URLResourceKey] = [
+            .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey
+        ]
+        private static let keySet = Set(keys)
+
+        private let enumerator: FileManager.DirectoryEnumerator?
+        /// true si el recorrido se cortó por cancelación antes de agotar el árbol: en ese caso
+        /// el ciclo no puede tratarse como un recorrido completo (afecta poda y bootstrap).
+        private(set) var stoppedEarly = false
+
+        init(rootDirectory: URL, logger: Logger) {
+            enumerator = FileManager.default.enumerator(
+                at: rootDirectory,
+                includingPropertiesForKeys: Self.keys,
+                options: [.skipsPackageDescendants, .skipsHiddenFiles]
+            )
+            if enumerator == nil {
+                logger.error("no se pudo enumerar \(rootDirectory.path, privacy: .public)")
+            }
+        }
+
+        func next() -> TranscriptEntry? {
+            guard let enumerator else { return nil }
+            while let url = enumerator.nextObject() as? URL {
+                if Task.isCancelled {
+                    stoppedEarly = true
+                    return nil
+                }
+                guard url.pathExtension == "jsonl" else { continue }
+                guard let values = try? url.resourceValues(forKeys: Self.keySet) else {
+                    return .failed(url)
+                }
+                guard values.isSymbolicLink != true, values.isRegularFile == true else { continue }
+                guard let size = values.fileSize, let modified = values.contentModificationDate else {
+                    return .failed(url)
+                }
+                return .file(TranscriptFile(url: url, size: UInt64(size), modified: modified))
+            }
             return nil
         }
-        return (UInt64(size), modified)
     }
 
     // MARK: - Lectura parcial

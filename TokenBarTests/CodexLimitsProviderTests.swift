@@ -132,16 +132,56 @@ struct CodexLimitsProviderTests {
         #expect(snapshot.source == .codex)
         #expect(snapshot.status == .ok)
         #expect(snapshot.planLabel == "pro")
+        // Orden global por duración: las dos de 5 horas (300 min) antes que las dos
+        // semanales (10 080 min), no agrupadas por contenedor.
         #expect(snapshot.windows.map(\.name) == [
-            "5 horas", "Semanal", "Codex Mini · 5 horas", "Codex Mini · Semanal"
+            "5 horas", "Codex Mini 5 horas", "Semanal", "Codex Mini semanal"
         ])
-        #expect(snapshot.windows.map(\.percent) == [25, 67, 40, 60])
+        #expect(snapshot.windows.map(\.percent) == [25, 40, 67, 60])
         #expect(abs(snapshot.windows[0].utilization - 0.245) < 0.0001)
-        #expect(abs(snapshot.windows[1].utilization - 0.67) < 0.0001)
+        #expect(abs(snapshot.windows[2].utilization - 0.67) < 0.0001)
         #expect(snapshot.windows[0].resetsAt == Date(timeIntervalSince1970: 1_790_100_000))
-        #expect(snapshot.windows[1].resetsAt == ISO8601DateFormatter().date(from: "2026-09-29T12:00:00Z"))
-        #expect(snapshot.windows[2].resetsAt == nil)
+        #expect(snapshot.windows[2].resetsAt == ISO8601DateFormatter().date(from: "2026-09-29T12:00:00Z"))
+        #expect(snapshot.windows[1].resetsAt == nil)
         #expect(snapshot.windows[3].resetsAt == nil)
+    }
+
+    @Test("el orden es global por duración aunque el contenedor base no traiga las 5 horas")
+    func ordenGlobalPorDuracion() throws {
+        // El contenedor base solo trae la semanal; el de "Codex Mini" sí trae la de 5
+        // horas. Concatenar por contenedor dejaría la semanal delante.
+        let json = """
+        {
+          "plan_type": "pro",
+          "rate_limit": {"secondary_window": {"used_percent": 50, "window_minutes": 10080}},
+          "additional_rate_limits": [
+            {"limit_name": "Codex Mini",
+             "rate_limit": {"primary_window": {"used_percent": 20, "window_minutes": 300}}}
+          ]
+        }
+        """
+        let snapshot = try #require(CodexLimitsProvider.parseUsage(Data(json.utf8)))
+        #expect(snapshot.windows.map(\.name) == ["Codex Mini 5 horas", "Semanal"])
+    }
+
+    @Test("un empate de duración lo desempata la posición: la ventana de la cuenta manda")
+    func empatePorDuracionMandaLaDeLaCuenta() throws {
+        // La ventana base y la de "Codex Mini" duran lo mismo (300 min). `sorted` no está
+        // garantizado estable, así que sin desempate explícito la del modelo podría colarse
+        // primero — y la fila plegada, que muestra `windows.first`, mostraría la cuota del
+        // modelo en vez de la de la cuenta.
+        let json = """
+        {
+          "plan_type": "pro",
+          "rate_limit": {"primary_window": {"used_percent": 20, "window_minutes": 300}},
+          "additional_rate_limits": [
+            {"limit_name": "Codex Mini",
+             "rate_limit": {"primary_window": {"used_percent": 50, "window_minutes": 300}}}
+          ]
+        }
+        """
+        let snapshot = try #require(CodexLimitsProvider.parseUsage(Data(json.utf8)))
+        #expect(snapshot.windows.map(\.name) == ["5 horas", "Codex Mini 5 horas"])
     }
 
     @Test("nombra ventanas conocidas y duraciones genéricas")
@@ -158,6 +198,29 @@ struct CodexLimitsProviderTests {
         #expect(CodexLimitsProvider.resetDate(from: 1_790_100_000_000 as NSNumber) == nil)
         #expect(CodexLimitsProvider.resetDate(from: "2026-09-29T12:00:00.123Z") ==
                 Date(timeIntervalSince1970: 1_790_683_200.123))
+    }
+
+    @Test("un porcentaje fuera de 0…100 rechaza la ventana en vez de mostrar una cifra imposible")
+    func porcentajeFueraDeRango() {
+        let json = """
+        {"plan_type":"pro",
+         "rate_limit":{"primary_window":{"used_percent":140,"window_minutes":300},
+                       "secondary_window":{"used_percent":20,"window_minutes":10080}}}
+        """
+        let snapshot = CodexLimitsProvider.parseUsage(Data(json.utf8))
+        #expect(snapshot?.windows.map(\.name) == ["Semanal"])
+    }
+
+    @Test("un window_minutes que no cabe en un Int no revienta la conversión")
+    func minutosQueNoCabenEnInt() {
+        // 10^20 es un Double finito y entero, pero no cabe en un Int.
+        let json = """
+        {"plan_type":"pro",
+         "rate_limit":{"primary_window":{"used_percent":20,"window_minutes":1e20},
+                       "secondary_window":{"used_percent":40,"window_minutes":10080}}}
+        """
+        let snapshot = CodexLimitsProvider.parseUsage(Data(json.utf8))
+        #expect(snapshot?.windows.map(\.name) == ["Semanal"])
     }
 
     @Test("rechaza formatos remotos desconocidos")
@@ -244,24 +307,39 @@ struct CodexLimitsProviderTests {
         #expect(snapshot.windows.first?.percent == 31)
     }
 
-    @Test("un 401 usa rollout y marca el dato como última actividad")
-    func unauthorizedConFallback() async throws {
+    @Test("401 y 403 son credenciales inválidas, con o sin rollout local")
+    func unauthorized() async throws {
+        for code in [401, 403] {
+            let harness = try Harness()
+            defer { harness.cleanUp() }
+            _ = try harness.writeRollout([Self.rolloutLine])
+            StubURLProtocol.setHandler { _ in (code, Data()) }
+            let snapshot = await harness.provider().fetch()
+            // Es un estado definitivo: manda aunque el rollout local tenga ventanas.
+            #expect(snapshot.status == .invalidCredentials)
+            #expect(snapshot.windows.isEmpty)
+        }
+    }
+
+    @Test("un 429 activa el backoff y conserva el rollout local si lo hay")
+    func rateLimitedConFallback() async throws {
         let harness = try Harness()
         defer { harness.cleanUp() }
         _ = try harness.writeRollout([Self.rolloutLine])
-        StubURLProtocol.setHandler { _ in (401, Data()) }
+        StubURLProtocol.setHandler { _ in (429, Data()) }
         let snapshot = await harness.provider().fetch()
-        #expect(snapshot.status == .failed("A la última actividad"))
+        #expect(snapshot.status == .failed("Límite de consultas alcanzado"))
+        #expect(snapshot.rateLimited)
         #expect(snapshot.windows.count == 2)
     }
 
-    @Test("un 401 sin rollout pide renovar Codex")
-    func unauthorizedSinFallback() async throws {
+    @Test("un 429 sin rollout local queda sin ventanas pero marcado para el backoff")
+    func rateLimitedSinFallback() async throws {
         let harness = try Harness()
         defer { harness.cleanUp() }
-        StubURLProtocol.setHandler { _ in (403, Data()) }
+        StubURLProtocol.setHandler { _ in (429, Data()) }
         let snapshot = await harness.provider().fetch()
-        #expect(snapshot.status == .failed("Abre Codex para renovar la sesión"))
+        #expect(snapshot.rateLimited)
         #expect(snapshot.windows.isEmpty)
     }
 

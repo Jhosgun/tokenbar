@@ -37,6 +37,8 @@ struct ClaudeLimitsProvider: LimitsProvider {
     static let networkFallbackAge: TimeInterval = 2 * 3600
     /// Mínimo entre consultas de red: el dato cambia en horas.
     static let networkInterval: TimeInterval = 15 * 60
+    /// Plazo absoluto para la consulta de red, más allá de `URLRequest.timeoutInterval`.
+    static let fetchBudget: Duration = .seconds(5)
 
     /// Ventanas que se muestran, en orden, con su etiqueta. La caché trae muchas más
     /// (buckets internos, la mayoría en `null`); solo interesan estas.
@@ -78,8 +80,14 @@ struct ClaudeLimitsProvider: LimitsProvider {
         // backoff, `fetch()` ni siquiera se llama.
         let needsNetwork = cached.map { $0.age >= Self.networkFallbackAge } ?? true
         if needsNetwork, await throttle.tryAttempt(now: now) {
-            let network = await fetchFromNetwork()
+            let network = await NetworkDeadline.run(budget: Self.fetchBudget) {
+                await self.fetchFromNetwork()
+            } ?? .empty(source, .failed("Tiempo de espera agotado"))
             if case .ok = network.status { return network }
+            // Un token rotado o revocado es un estado definitivo: manda sobre la caché,
+            // aunque esta todavía tenga ventanas que mostrar. Mostrarlas ocultaría que hay
+            // que volver a iniciar sesión.
+            if case .invalidCredentials = network.status { return network }
             // El 429 tiene que llegar al ViewModel para el backoff, pero sin tirar la
             // caché: se devuelve con las ventanas y la marca de rate limit.
             if network.rateLimited, let cached {
@@ -128,7 +136,8 @@ struct ClaudeLimitsProvider: LimitsProvider {
         // Pasados 30 min el dato se muestra, pero marcado como desactualizado.
         let status: CollectorStatus = age > staleAge ? .failed(ago(age)) : .ok
         return CachedUsage(snapshot: LimitsSnapshot(source: .claudeCode, windows: windows,
-                                                    planLabel: nil, status: status),
+                                                    planLabel: nil, status: status,
+                                                    dataAsOf: fetchedAt),
                            age: age)
     }
 
@@ -245,13 +254,16 @@ struct ClaudeLimitsProvider: LimitsProvider {
         let windows = windows(from: root)
         guard !windows.isEmpty else { return nil }
 
-        // Créditos extra: solo se muestra como etiqueta si están habilitados.
+        // Créditos extra: solo se muestra como etiqueta si están habilitados. Cifras que no
+        // quepan en un Int (o no finitas) se descartan en vez de reventar la conversión.
         var plan: String?
         if let extra = root["extra_usage"] as? [String: Any],
            extra["is_enabled"] as? Bool == true,
-           let used = (extra["used_credits"] as? NSNumber)?.doubleValue,
-           let limit = (extra["monthly_limit"] as? NSNumber)?.doubleValue, limit > 0 {
-            plan = "créditos \(Int(used))/\(Int(limit))"
+           let used = (extra["used_credits"] as? NSNumber)?.doubleValue, used.isFinite,
+           let limit = (extra["monthly_limit"] as? NSNumber)?.doubleValue, limit.isFinite, limit > 0,
+           let usedInt = Int(exactly: used.rounded()),
+           let limitInt = Int(exactly: limit.rounded()) {
+            plan = "créditos \(usedInt)/\(limitInt)"
         }
 
         return LimitsSnapshot(source: .claudeCode, windows: windows, planLabel: plan, status: .ok)
@@ -263,9 +275,10 @@ struct ClaudeLimitsProvider: LimitsProvider {
     private static func windows(from container: [String: Any]) -> [LimitWindow] {
         let known: [LimitWindow] = windowLabels.compactMap { key, label in
             guard let bucket = container[key] as? [String: Any],
-                  let raw = (bucket["utilization"] as? NSNumber)?.doubleValue else { return nil }
+                  let raw = (bucket["utilization"] as? NSNumber)?.doubleValue,
+                  let utilization = LimitWindow.utilization(fromPercent: raw) else { return nil }
             return LimitWindow(name: label,
-                               utilization: raw / 100,
+                               utilization: utilization,
                                resetsAt: date(from: bucket["resets_at"]))
         }
         return known + scopedWindows(from: container, alreadyShown: Set(known.map(\.name)))
@@ -285,12 +298,13 @@ struct ClaudeLimitsProvider: LimitsProvider {
         return limits.compactMap { limit in
             guard limit["kind"] as? String == "weekly_scoped",
                   let percent = (limit["percent"] as? NSNumber)?.doubleValue,
+                  let utilization = LimitWindow.utilization(fromPercent: percent),
                   let scope = limit["scope"] as? [String: Any],
                   let model = scope["model"] as? [String: Any],
                   let name = model["display_name"] as? String, !name.isEmpty else { return nil }
             let label = "\(name) semanal"
             guard seen.insert(label).inserted else { return nil }
-            return LimitWindow(name: label, utilization: percent / 100, resetsAt: weeklyReset)
+            return LimitWindow(name: label, utilization: utilization, resetsAt: weeklyReset)
         }
     }
 
@@ -306,18 +320,9 @@ struct ClaudeLimitsProvider: LimitsProvider {
     }
 
     /// Convierte el header `Retry-After` de una respuesta 429 en una fecha de reintento.
-    /// Acepta tanto delta-segundos (`60`) como fecha HTTP (`Wed, 21 Oct 2015 07:28:00 GMT`).
+    /// Delega en `RetryAfter`, compartido por los seis proveedores.
     static func retryAfter(from response: HTTPURLResponse, now: Date = Date()) -> Date? {
-        guard let value = response.value(forHTTPHeaderField: "Retry-After")?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
-        if let seconds = Double(value), seconds.isFinite {
-            return now.addingTimeInterval(max(0, seconds))
-        }
-        let rfc1123 = DateFormatter()
-        rfc1123.locale = Locale(identifier: "en_US_POSIX")
-        rfc1123.timeZone = TimeZone(secondsFromGMT: 0)
-        rfc1123.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        return rfc1123.date(from: value)
+        RetryAfter.date(from: response, now: now)
     }
 
     /// Válvula que impide consultar la red más de una vez cada `interval`. Vive en el

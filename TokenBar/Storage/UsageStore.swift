@@ -17,8 +17,33 @@ struct UsageSnapshot: Sendable, Equatable {
     var last7DaysByApp: [AppSource: [DayTotal]]
     var todayTotalTokens: Int
     var todayCostUSD: Double
+    /// Días consecutivos con consumo, terminando hoy o ayer. Ver `Streak.current`.
+    var currentStreak: Int
+    /// La racha más larga vista hasta ahora. Nunca decrece, ni cuando la actual se rompe.
+    var bestStreak: Int
 
-    /// Placeholder inicial de UI: 3 apps en cero y 7 días en cero.
+    /// Total de tokens de cada uno de los últimos 7 días, sumando todas las apps. Se deriva
+    /// de `last7DaysByApp`, que ya trae la misma ventana de días para todas: no hace falta
+    /// guardar esto aparte.
+    var weekTotals: [DayTotal] {
+        guard let days = last7DaysByApp.values.first?.map(\.day) else { return [] }
+        return days.enumerated().map { index, day in
+            let total = last7DaysByApp.values.reduce(0) { partial, series in
+                guard series.indices.contains(index) else { return partial }
+                return partial + series[index].tokens
+            }
+            return DayTotal(day: day, tokens: total)
+        }
+    }
+
+    var weekTotalTokens: Int { weekTotals.reduce(0) { $0 + $1.tokens } }
+
+    /// Redondeado hacia abajo, como el resto de los conteos enteros de la app.
+    var weekAverageTokens: Int {
+        weekTotals.isEmpty ? 0 : weekTotalTokens / weekTotals.count
+    }
+
+    /// Placeholder inicial de UI: 3 apps en cero, 7 días en cero y racha en cero.
     /// Ojo: se evalúa una sola vez, así que no sirve como "hoy" tras cambiar de día.
     static let empty: UsageSnapshot = {
         let today = DayKey.today()
@@ -32,7 +57,9 @@ struct UsageSnapshot: Sendable, Equatable {
         return UsageSnapshot(todayByApp: byApp,
                              last7DaysByApp: series,
                              todayTotalTokens: 0,
-                             todayCostUSD: 0)
+                             todayCostUSD: 0,
+                             currentStreak: 0,
+                             bestStreak: 0)
     }()
 }
 
@@ -63,13 +90,42 @@ actor UsageStore {
         var day: String
     }
 
-    /// Formato en disco de `usage.json`.
+    /// Formato en disco de `usage.json`. `dailyTotals` y `bestStreak` son nuevos: un
+    /// archivo viejo que no los trae decodifica a `[:]` / `0` en vez de fallar.
     private struct Payload: Codable {
         var version: Int
         var records: [UsageRecord]
+        /// Total de tokens por día, todas las apps sumadas. A diferencia de `records`
+        /// (detalle por app, 90 días) esto se conserva 365 días: es lo que sostiene la
+        /// racha a largo plazo sin tener que guardar el detalle completo tanto tiempo.
+        var dailyTotals: [String: Int]
+        var bestStreak: Int
+
+        init(version: Int, records: [UsageRecord], dailyTotals: [String: Int], bestStreak: Int) {
+            self.version = version
+            self.records = records
+            self.dailyTotals = dailyTotals
+            self.bestStreak = bestStreak
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case version, records, dailyTotals, bestStreak
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            version = try container.decode(Int.self, forKey: .version)
+            records = try container.decode([UsageRecord].self, forKey: .records)
+            dailyTotals = try container.decodeIfPresent([String: Int].self, forKey: .dailyTotals) ?? [:]
+            bestStreak = try container.decodeIfPresent(Int.self, forKey: .bestStreak) ?? 0
+        }
     }
 
     private var records: [Key: UsageRecord] = [:]
+    /// Total de tokens por día (todas las apps), independiente de `records`. Ver `Payload`.
+    private var dailyTotals: [String: Int] = [:]
+    /// Mejor racha vista hasta ahora. Solo crece: `apply` la compara contra la racha actual.
+    private var bestStreak = 0
     /// Evita que un `load()` tardío pise deltas ya aplicados por un refresh concurrente.
     private var isLoaded = false
 
@@ -87,6 +143,8 @@ actor UsageStore {
         ensureDirectory()
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             records = [:]
+            dailyTotals = [:]
+            bestStreak = 0
             return
         }
         do {
@@ -103,11 +161,30 @@ actor UsageStore {
                 }
             }
             records = loaded
+            // Migración tolerante: un archivo de antes de `dailyTotals` no trae el resumen
+            // diario. Se reconstruye sumando lo que sí sobrevivió en `records`; no hay
+            // pérdida real porque ese archivo tampoco tenía más historia que esa.
+            if payload.dailyTotals.isEmpty && !payload.records.isEmpty {
+                dailyTotals = Self.aggregateDailyTotals(from: loaded)
+            } else {
+                dailyTotals = payload.dailyTotals
+            }
+            bestStreak = payload.bestStreak
+            // Un archivo migrado no traía `bestStreak`: sin esto se vería en 0 aunque el
+            // detalle reconstruido ya implique una racha en curso. `updateBestStreak` no
+            // baja nada, así que en un archivo ya migrado esto es un no-op.
+            let beforeMigrationCheck = bestStreak
+            updateBestStreak()
+            if bestStreak != beforeMigrationCheck {
+                persist()
+            }
         } catch {
             let path = fileURL.path
             let reason = error.localizedDescription
             log.warning("usage.json ilegible en \(path, privacy: .public), se arranca vacío: \(reason, privacy: .public)")
             records = [:]
+            dailyTotals = [:]
+            bestStreak = 0
         }
     }
 
@@ -125,7 +202,9 @@ actor UsageStore {
             } else {
                 records[key] = record
             }
+            dailyTotals[record.day, default: 0] += record.totalTokens
         }
+        updateBestStreak()
         persist()
         return added
     }
@@ -155,22 +234,64 @@ actor UsageStore {
         return UsageSnapshot(todayByApp: todayByApp,
                              last7DaysByApp: last7DaysByApp,
                              todayTotalTokens: totalTokens,
-                             todayCostUSD: totalCost)
+                             todayCostUSD: totalCost,
+                             currentStreak: Streak.current(activeDays: activeDays(), today: today),
+                             bestStreak: bestStreak)
     }
 
-    /// Borra los días con más de `days` de antigüedad respecto a hoy y persiste.
-    /// Conserva una ventana de exactamente `days` días: `hoy - (days - 1)` … `hoy`.
-    /// Si no hay nada que borrar no reescribe el archivo.
-    func purge(olderThanDays days: Int) async {
+    /// Borra el detalle por herramienta con más de `days` de antigüedad y, si se da
+    /// `summaryDays`, borra el resumen diario (`dailyTotals`) por separado con esa
+    /// retención más larga —por defecto la misma que `days`, para no romper a quien ya
+    /// llamaba a este método con una sola ventana—. Conserva `hoy - (n - 1)` … `hoy` en
+    /// cada caso. Si no hay nada que borrar en ninguno de los dos, no reescribe el archivo.
+    func purge(olderThanDays days: Int, summaryDays: Int? = nil) async {
         let calendar = Calendar.current
-        guard let cutoffDate = calendar.date(byAdding: .day, value: -days, to: Date()) else { return }
-        // "yyyy-MM-dd" es lexicográficamente ordenable, así que basta comparar strings.
-        // Estricto (`>`): el día que cumple justo `days` de antigüedad ya queda fuera.
-        let cutoff = DayKey.string(from: cutoffDate, calendar: calendar)
-        let before = records.count
-        records = records.filter { $0.key.day > cutoff }
-        guard records.count != before else { return }
+        var changed = false
+
+        if let cutoffDate = calendar.date(byAdding: .day, value: -days, to: Date()) {
+            // "yyyy-MM-dd" es lexicográficamente ordenable, así que basta comparar strings.
+            // Estricto (`>`): el día que cumple justo `days` de antigüedad ya queda fuera.
+            let cutoff = DayKey.string(from: cutoffDate, calendar: calendar)
+            let before = records.count
+            records = records.filter { $0.key.day > cutoff }
+            changed = changed || records.count != before
+        }
+
+        let summaryRetention = summaryDays ?? days
+        if let summaryCutoffDate = calendar.date(byAdding: .day, value: -summaryRetention, to: Date()) {
+            let summaryCutoff = DayKey.string(from: summaryCutoffDate, calendar: calendar)
+            let before = dailyTotals.count
+            dailyTotals = dailyTotals.filter { $0.key > summaryCutoff }
+            changed = changed || dailyTotals.count != before
+        }
+
+        guard changed else { return }
         persist()
+    }
+
+    // MARK: - Racha
+
+    /// Días con consumo (> 0 tokens), según el resumen diario.
+    private func activeDays() -> Set<String> {
+        Set(dailyTotals.filter { $0.value > 0 }.keys)
+    }
+
+    /// Sube `bestStreak` si el historial retenido tiene una racha más larga. Usa
+    /// `longestRun` (todo el historial), no `current` (solo la racha vigente): una racha
+    /// vieja que ya terminó también debe quedar como mejor marca. Nunca la baja.
+    private func updateBestStreak() {
+        let longest = Streak.longestRun(activeDays: activeDays())
+        bestStreak = max(bestStreak, longest)
+    }
+
+    /// Reconstruye el resumen diario sumando el detalle por app: lo que usa la migración
+    /// desde un `usage.json` de antes de que existiera `dailyTotals`.
+    private static func aggregateDailyTotals(from records: [Key: UsageRecord]) -> [String: Int] {
+        var totals: [String: Int] = [:]
+        for record in records.values {
+            totals[record.day, default: 0] += record.totalTokens
+        }
+        return totals
     }
 
     // MARK: - Disco
@@ -192,7 +313,8 @@ actor UsageStore {
         let sorted = records.values.sorted {
             ($0.source.rawValue, $0.day) < ($1.source.rawValue, $1.day)
         }
-        let payload = Payload(version: Self.formatVersion, records: sorted)
+        let payload = Payload(version: Self.formatVersion, records: sorted,
+                              dailyTotals: dailyTotals, bestStreak: bestStreak)
         do {
             let data = try Self.makeEncoder().encode(payload)
             try data.write(to: fileURL, options: [.atomic])

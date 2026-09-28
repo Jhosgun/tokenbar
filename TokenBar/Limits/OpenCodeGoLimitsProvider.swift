@@ -13,6 +13,8 @@ struct OpenCodeGoLimitsProvider: LimitsProvider {
             .appending(path: ".local/share/opencode/auth.json")
     }
 
+    /// Plazo absoluto para la consulta de red, más allá de `URLRequest.timeoutInterval`.
+    static let fetchBudget: Duration = .seconds(5)
     private static let log = Logger(subsystem: "io.github.jhosgun.tokenbar", category: "opencode-limits")
     private static let windowLabels: [(key: String, label: String)] = [
         ("rolling", "5 horas"),
@@ -36,7 +38,12 @@ struct OpenCodeGoLimitsProvider: LimitsProvider {
         guard let key = Self.apiKey(at: authURL) else {
             return .empty(source, .notConfigured)
         }
+        return await NetworkDeadline.run(budget: Self.fetchBudget) {
+            await self.requestUsage(key: key)
+        } ?? .empty(source, .failed("Tiempo de espera agotado"))
+    }
 
+    private func requestUsage(key: String) async -> LimitsSnapshot {
         var request = URLRequest(url: Endpoint.usage)
         request.timeoutInterval = 5
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -50,6 +57,7 @@ struct OpenCodeGoLimitsProvider: LimitsProvider {
                 switch http.statusCode {
                 case 200..<300: break
                 case 401, 403: return .empty(source, .invalidCredentials)
+                case 429: return .rateLimited(source, retryAfter: RetryAfter.date(from: http))
                 default: return .empty(source, .failed("HTTP \(http.statusCode)"))
                 }
             }
@@ -84,11 +92,12 @@ struct OpenCodeGoLimitsProvider: LimitsProvider {
             if let usage = root["usage"] as? [String: Any] {
                 let windows = windowLabels.compactMap { item -> LimitWindow? in
                     guard let bucket = usage[item.key] as? [String: Any],
-                          let percent = number(bucket["percent"]), percent.isFinite, percent >= 0 else {
+                          let percent = number(bucket["percent"]),
+                          let utilization = LimitWindow.utilization(fromPercent: percent) else {
                         return nil
                     }
                     return LimitWindow(name: item.label,
-                                       utilization: percent / 100,
+                                       utilization: utilization,
                                        resetsAt: date(from: bucket["resetsAt"]))
                 }
                 guard !windows.isEmpty else { return nil }
@@ -97,12 +106,13 @@ struct OpenCodeGoLimitsProvider: LimitsProvider {
             // Forma anterior: {"rolling":{"usagePercent":…,"resetInSec":…},…}
             let windows = windowLabels.compactMap { item -> LimitWindow? in
                 guard let bucket = root[item.key] as? [String: Any],
-                      let percent = number(bucket["usagePercent"]), percent.isFinite, percent >= 0,
+                      let percent = number(bucket["usagePercent"]),
+                      let utilization = LimitWindow.utilization(fromPercent: percent),
                       let reset = number(bucket["resetInSec"]), reset.isFinite, reset >= 0 else {
                     return nil
                 }
                 return LimitWindow(name: item.label,
-                                   utilization: percent / 100,
+                                   utilization: utilization,
                                    resetsAt: now.addingTimeInterval(reset))
             }
             guard !windows.isEmpty else { return nil }
@@ -115,12 +125,13 @@ struct OpenCodeGoLimitsProvider: LimitsProvider {
         })
         let windows = windowLabels.compactMap { item -> LimitWindow? in
             guard let bucket = buckets[item.key],
-                  let percent = number(bucket["usagePercent"]), percent.isFinite, percent >= 0,
+                  let percent = number(bucket["usagePercent"]),
+                  let utilization = LimitWindow.utilization(fromPercent: percent),
                   let reset = number(bucket["resetInSec"]), reset.isFinite, reset >= 0 else {
                 return nil
             }
             return LimitWindow(name: item.label,
-                               utilization: percent / 100,
+                               utilization: utilization,
                                resetsAt: now.addingTimeInterval(reset))
         }
         guard !windows.isEmpty else { return nil }

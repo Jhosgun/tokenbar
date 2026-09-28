@@ -183,6 +183,28 @@ struct UsageViewModelLimitsTests {
         #expect(await provider.fetchCount == 2)
     }
 
+    @Test("dataAsOf manda sobre 'now': un snapshot fallido con dato viejo no dice 'ahora'")
+    @MainActor
+    func dataAsOfMandaSobreNow() async {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        let clock = Clock(t0)
+        // El dato real es de hace 47 min (por ejemplo la caché de ClaudeLimitsProvider),
+        // aunque la consulta que lo trae ocurra justo ahora.
+        let stale = LimitsSnapshot(source: .claudeCode,
+                                   windows: [LimitWindow(name: "Semanal", utilization: 0.71)],
+                                   planLabel: nil, status: .failed("hace 47m"),
+                                   dataAsOf: t0.addingTimeInterval(-47 * 60))
+        let provider = ScriptedLimitsProvider(source: .claudeCode, script: [stale])
+        let (vm, dir) = makeViewModel(providers: [provider], clock: clock)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        await vm.refresh()
+        // Antes de este arreglo, lastGoodAt quedaba en `now` (t0) y la fila decía "ahora"
+        // en vez de reflejar los 47 minutos reales del dato.
+        #expect(vm.lastGoodAt[.claudeCode] == t0.addingTimeInterval(-47 * 60))
+        #expect(SourceRowView.ago(vm.lastGoodAt[.claudeCode]!, now: t0) == "hace 47m")
+    }
+
     @Test("un fallo con ventanas las muestra marcadas y las vuelve el último bueno")
     @MainActor
     func falloConVentanasLasMuestra() async {

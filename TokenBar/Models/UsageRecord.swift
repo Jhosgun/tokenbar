@@ -75,6 +75,45 @@ enum DayKey {
         return days
     }
 
+    /// Parsea una clave de día de vuelta a `Date` (medianoche, zona horaria del calendario
+    /// recibido). `nil` si el string no tiene exactamente el formato "yyyy-MM-dd" (4-2-2
+    /// dígitos, sin campos vacíos) o si describe una fecha que no existe (por ejemplo el 31
+    /// de febrero): `Calendar` normaliza esas fechas al día válido más cercano en vez de
+    /// fallar, así que hay que comprobar que los componentes sobrevivan el viaje de ida y
+    /// vuelta.
+    static func date(from dayString: String, calendar: Calendar = .current) -> Date? {
+        // `omittingEmptySubsequences: false` para que un separador doblado ("2026--08-03")
+        // deje un campo vacío en vez de desaparecer y correr el resto de columnas.
+        let parts = dayString.split(separator: "-", omittingEmptySubsequences: false)
+        // Solo dígitos ASCII: sin esto, "+1" o "-1" pasan el chequeo de ancho y `Int(_:)`
+        // los acepta igual (con signo), coloándose como si fueran "01".
+        guard parts.count == 3,
+              parts[0].count == 4, parts[1].count == 2, parts[2].count == 2,
+              parts.allSatisfy({ $0.allSatisfy { $0 >= "0" && $0 <= "9" } }),
+              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2])
+        else { return nil }
+
+        var components = DateComponents()
+        components.year = year
+        components.month = month
+        components.day = day
+        let cal = gregorian(from: calendar)
+        guard let date = cal.date(from: components) else { return nil }
+
+        let roundTrip = cal.dateComponents([.year, .month, .day], from: date)
+        guard roundTrip.year == year, roundTrip.month == month, roundTrip.day == day else { return nil }
+        return date
+    }
+
+    /// Día que resulta de sumar `days` (puede ser negativo) al día dado. `nil` si el string
+    /// no tiene el formato "yyyy-MM-dd" o si el cálculo de calendario falla.
+    static func adding(_ days: Int, to dayString: String, calendar: Calendar = .current) -> String? {
+        guard let date = date(from: dayString, calendar: calendar) else { return nil }
+        let cal = gregorian(from: calendar)
+        guard let shifted = cal.date(byAdding: .day, value: days, to: date) else { return nil }
+        return string(from: shifted, calendar: cal)
+    }
+
     /// Calendario gregoriano con la zona horaria del calendario recibido, para que la clave
     /// sea siempre "yyyy-MM-dd" proléptico gregoriano sin importar el calendario del sistema.
     private static func gregorian(from calendar: Calendar) -> Calendar {

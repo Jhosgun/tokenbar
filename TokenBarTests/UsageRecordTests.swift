@@ -170,6 +170,46 @@ struct DayKeyTests {
         #expect(DayKey.lastDays(-1, endingAt: end, calendar: utc).isEmpty)
         #expect(DayKey.lastDays(1, endingAt: end, calendar: utc) == ["2026-08-03"])
     }
+
+    @Test("date(from:) parsea la clave de vuelta al mismo día")
+    func dateDesdeString() throws {
+        let utc = try calendar(in: "UTC")
+        let date = try #require(DayKey.date(from: "2026-08-03", calendar: utc))
+        #expect(DayKey.string(from: date, calendar: utc) == "2026-08-03")
+    }
+
+    @Test("date(from:) devuelve nil con un formato inválido")
+    func dateDesdeStringInvalido() {
+        #expect(DayKey.date(from: "no-es-una-fecha") == nil)
+        #expect(DayKey.date(from: "2026-08") == nil)
+        // Un separador doblado deja un campo vacío: antes se descartaba silenciosamente y
+        // corría el resto de columnas, devolviendo una fecha inventada.
+        #expect(DayKey.date(from: "2026--08-03") == nil)
+        // El 31 de febrero no existe: `Calendar` lo normaliza al día siguiente válido en vez
+        // de fallar, así que hay que rechazarlo aparte comprobando el viaje de ida y vuelta.
+        #expect(DayKey.date(from: "2026-02-31") == nil)
+        // "+1" tiene el mismo ancho que "01" y `Int(_:)` lo acepta con signo: sin exigir
+        // dígitos ASCII puros esto colaba como si fuera enero.
+        #expect(DayKey.date(from: "2026-+1-01") == nil)
+        #expect(DayKey.date(from: "2026-08-+3") == nil)
+    }
+
+    @Test("adding suma y resta días cruzando meses y años")
+    func addingCruzaFronteras() throws {
+        let utc = try calendar(in: "UTC")
+        #expect(DayKey.adding(1, to: "2026-08-03", calendar: utc) == "2026-08-04")
+        #expect(DayKey.adding(-1, to: "2026-08-01", calendar: utc) == "2026-07-31")
+        #expect(DayKey.adding(-1, to: "2026-01-01", calendar: utc) == "2025-12-31")
+        #expect(DayKey.adding(0, to: "2026-08-03", calendar: utc) == "2026-08-03")
+    }
+
+    @Test("adding devuelve nil con un formato inválido")
+    func addingConFormatoInvalido() {
+        #expect(DayKey.adding(1, to: "no-es-una-fecha") == nil)
+        #expect(DayKey.adding(1, to: "2026--08-03") == nil)
+        #expect(DayKey.adding(1, to: "2026-02-31") == nil)
+        #expect(DayKey.adding(1, to: "2026-+1-01") == nil)
+    }
 }
 
 // MARK: - Pricing

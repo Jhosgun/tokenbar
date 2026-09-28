@@ -107,6 +107,32 @@ struct ClaudeLimitsProviderTests {
         #expect(snapshot.planLabel == "créditos 250/10000")
     }
 
+    @Test("un porcentaje fuera de 0…100 se rechaza en vez de mostrar una cifra imposible")
+    func porcentajeFueraDeRango() {
+        // -5% o 250% no pueden ser un consumo real: la ventana se omite en vez de
+        // acotarse a un valor inventado.
+        let negativo = #"{"five_hour":{"utilization":-5.0},"seven_day":{"utilization":40.0}}"#
+        let snapshotNegativo = ClaudeLimitsProvider.parse(Data(negativo.utf8))
+        #expect(snapshotNegativo?.windows.map(\.name) == ["Semanal"])
+
+        let excesivo = #"{"five_hour":{"utilization":250.0}}"#
+        #expect(ClaudeLimitsProvider.parse(Data(excesivo.utf8)) == nil)
+    }
+
+    @Test("un crédito extra que no cabe en un Int no revienta la conversión")
+    func creditoQueNoCabeEnInt() throws {
+        // 10^20 es un Double finito, pero no cabe en un Int (tope ~9.2×10^18).
+        let json = """
+        {"five_hour":{"utilization":5.0},
+         "extra_usage":{"is_enabled":true,"monthly_limit":10000,"used_credits":1e20}}
+        """
+        let snapshot = try #require(ClaudeLimitsProvider.parse(Data(json.utf8)))
+        // La cifra imposible se descarta: no hay etiqueta de créditos, pero la ventana de
+        // 5 horas —que no depende de esto— sigue apareciendo.
+        #expect(snapshot.planLabel == nil)
+        #expect(snapshot.windows.count == 1)
+    }
+
     @Test("una respuesta sin ninguna ventana conocida se rechaza")
     func respuestaSinVentanas() {
         #expect(ClaudeLimitsProvider.parse(Data("{}".utf8)) == nil)
@@ -385,6 +411,47 @@ struct ClaudeLocalCacheTests {
         #expect(NeverProtocol.calls.value == 0)
     }
 
+    /// URLProtocol que responde siempre con un código fijo, para simular un 401/403 de red.
+    private final class FixedStatusProtocol: URLProtocol {
+        nonisolated(unsafe) static var statusCode = 401
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+        override func startLoading() {
+            let response = HTTPURLResponse(url: request.url!, statusCode: Self.statusCode,
+                                           httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data())
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        override func stopLoading() {}
+
+        static func makeSession() -> URLSession {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [FixedStatusProtocol.self]
+            return URLSession(configuration: configuration)
+        }
+    }
+
+    @Test("un token rechazado por la red manda sobre la caché vieja, aunque tenga ventanas")
+    func credencialInvalidaMandaSobreCache() async throws {
+        let utilization = #"{"five_hour":{"utilization":21.0},"seven_day":{"utilization":71}}"#
+        let vieja3h = try write(Self.fixture(fetchedAtMs: Self.ms(Date().addingTimeInterval(-3 * 3600)),
+                                             utilization: utilization))
+        defer { try? FileManager.default.removeItem(at: vieja3h) }
+
+        FixedStatusProtocol.statusCode = 401
+        let provider = ClaudeLimitsProvider(
+            cacheURL: vieja3h,
+            session: FixedStatusProtocol.makeSession(),
+            tokenCache: KeychainTokenCache(read: { "tok" }),
+            userAgent: "claude-code/test")
+        let snapshot = await provider.fetch()
+        // Antes de este arreglo, esto devolvía la caché de 3 h marcada "hace 3h" en vez de
+        // avisar que hay que volver a iniciar sesión.
+        #expect(snapshot.status == .invalidCredentials)
+        #expect(snapshot.windows.isEmpty)
+    }
+
     @Test("caché de más de 2 h intenta la red; sin token se muestra la caché marcada")
     func cacheViejaSinToken() async throws {
         let utilization = #"{"five_hour":{"utilization":21.0},"seven_day":{"utilization":71}}"#
@@ -564,6 +631,26 @@ struct CursorLimitsProviderTests {
         #expect(summary.extraWindows.isEmpty)
     }
 
+    @Test("Auto y Modelos con nombre aparecen como ventanas propias junto al ciclo")
+    func autoYModelosConNombre() throws {
+        let json = """
+        {"billingCycleEnd":"2026-10-07T02:26:43Z","membershipType":"pro_plus",
+         "individualUsage":{"plan":{"totalPercentUsed":66.5,"autoPercentUsed":66.4,
+                                    "apiPercentUsed":67.9}}}
+        """
+        let summary = try #require(CursorLimitsProvider.parseSummary(Data(json.utf8)))
+        #expect(summary.utilization == 0.665)
+        #expect(summary.extraWindows.map(\.name) == ["Auto", "Modelos con nombre"])
+        #expect(summary.extraWindows[0].percent == 66)
+        #expect(summary.extraWindows[1].percent == 68)
+    }
+
+    @Test("sin autoPercentUsed ni apiPercentUsed no hay ventanas extra")
+    func sinAutoNiApi() throws {
+        let summary = try #require(CursorLimitsProvider.parseSummary(Data(Self.summary.utf8)))
+        #expect(summary.extraWindows.isEmpty)
+    }
+
     @Test("muestra bajo demanda solo cuando tiene un tope explícito")
     func bajoDemanda() throws {
         let json = """
@@ -644,6 +731,17 @@ struct CursorLimitsProviderTests {
             #expect(snapshot.status == .invalidCredentials)
             #expect(snapshot.windows.isEmpty)
         }
+    }
+
+    @Test("un 429 activa el backoff del ViewModel, no un .failed pelado")
+    func rateLimited() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        StubURLProtocol.setHandler { _ in (429, Data()) }
+        let snapshot = await harness.provider().fetch()
+        #expect(snapshot.rateLimited)
+        #expect(snapshot.status == .failed("Límite de consultas alcanzado"))
+        #expect(snapshot.windows.isEmpty)
     }
 
     @Test("formatos desconocidos fallan sin inventar cifras")

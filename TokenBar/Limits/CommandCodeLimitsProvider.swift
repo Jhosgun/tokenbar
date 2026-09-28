@@ -71,6 +71,8 @@ struct CommandCodeLimitsProvider: LimitsProvider {
             return snapshot
         } catch RequestError.invalidCredentials {
             return .empty(source, .invalidCredentials)
+        } catch RequestError.rateLimited(let retryAfter) {
+            return .rateLimited(source, retryAfter: retryAfter)
         } catch RequestError.http(let status) {
             return .empty(source, .failed("HTTP \(status)"))
         } catch RequestError.invalidURL {
@@ -131,11 +133,11 @@ struct CommandCodeLimitsProvider: LimitsProvider {
         }
         // `monthlyCredits` de credits es lo que QUEDA del mes y `totalMonthlyCredits`
         // del summary lo ya usado: el cupo mensual es la suma de ambos.
-        if let used = number(summary["totalMonthlyCredits"]), used.isFinite, used >= 0,
+        if let used = number(summary["totalMonthlyCredits"]),
            let remaining = number(credits["monthlyCredits"]), remaining.isFinite, remaining >= 0,
-           used + remaining > 0 {
+           let utilization = LimitWindow.utilization(used: used, cap: used + remaining) {
             windows.append(LimitWindow(name: "Mes",
-                                       utilization: used / (used + remaining),
+                                       utilization: utilization,
                                        resetsAt: date(from: subscription.currentPeriodEnd)))
         }
         guard !windows.isEmpty else { return nil }
@@ -172,10 +174,11 @@ struct CommandCodeLimitsProvider: LimitsProvider {
 
     private static func window(from value: Any?, name: String) -> LimitWindow? {
         guard let bucket = value as? [String: Any],
-              let used = number(bucket["used"]), used.isFinite, used >= 0,
-              let cap = number(bucket["cap"]), cap.isFinite, cap > 0 else { return nil }
+              let used = number(bucket["used"]),
+              let cap = number(bucket["cap"]),
+              let utilization = LimitWindow.utilization(used: used, cap: cap) else { return nil }
         return LimitWindow(name: name,
-                           utilization: used / cap,
+                           utilization: utilization,
                            resetsAt: date(from: bucket["resetAt"]))
     }
 
@@ -205,6 +208,7 @@ struct CommandCodeLimitsProvider: LimitsProvider {
 
     private enum RequestError: Error {
         case invalidCredentials
+        case rateLimited(Date?)
         case http(Int)
         case invalidURL
     }
@@ -234,6 +238,7 @@ struct CommandCodeLimitsProvider: LimitsProvider {
             switch http.statusCode {
             case 200..<300: break
             case 401, 403: throw RequestError.invalidCredentials
+            case 429: throw RequestError.rateLimited(RetryAfter.date(from: http))
             default: throw RequestError.http(http.statusCode)
             }
         }
