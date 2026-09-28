@@ -217,7 +217,9 @@ struct SourceRowView: View {
         return parts.joined(separator: ", ")
     }
 
-    static func ago(_ date: Date, now: Date) -> String {
+    /// `nonisolated` a propósito: es una función pura y los tests la llaman desde un
+    /// contexto síncrono. En SDKs donde `View` implica `@MainActor`, sin esto no compila.
+    nonisolated static func ago(_ date: Date, now: Date) -> String {
         let minutes = Int(max(0, now.timeIntervalSince(date)) / 60)
         switch minutes {
         case 0:        return "ahora"
