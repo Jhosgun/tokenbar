@@ -2,6 +2,7 @@ import Testing
 
 @testable import TokenBar
 
+@MainActor
 @Suite("Tabla compacta de Estadísticas")
 struct StatsTableViewTests {
 
