@@ -25,13 +25,31 @@ struct SourceRowView: View {
     @Binding var isExpanded: Bool
 
     private var windows: [LimitWindow] { snapshot?.windows ?? [] }
+    private var isStale: Bool {
+        guard let lastGoodAt else { return false }
+        return now.timeIntervalSince(lastGoodAt) > 10 * 60
+    }
+
+    private var limitMessage: String? {
+        snapshot?.status.uiMessage
+    }
+
+    private var ageMessage: String? {
+        guard isStale, let lastGoodAt else { return nil }
+        return Self.ago(lastGoodAt, now: now)
+    }
 
     /// La línea de tokens se muestra cuando la herramienta tiene fuente de tokens y hay un
     /// registro de hoy, aunque sea de cero: un día sin consumo es un dato, no una fuente
     /// ausente.
-    private var tokensRecord: UsageRecord? {
+    var tokensRecord: UsageRecord? {
         guard source.hasTokenSource else { return nil }
-        return record ?? UsageRecord(source: source, day: DayKey.today())
+        if let record {
+            guard tokensStatus == .ok || record.totalTokens > 0 || record.costUSD > 0 else { return nil }
+            return record
+        }
+        guard tokensStatus == .ok else { return nil }
+        return UsageRecord(source: source, day: DayKey.today())
     }
 
     /// Mensaje del contador de tokens cuando no está bien ("No configurado", "Token
@@ -81,10 +99,16 @@ struct SourceRowView: View {
 
             Spacer(minLength: 4)
 
-            if let primary = snapshot?.primary {
+            if let primary = snapshot?.primary(at: now) {
+                if let limitMessage {
+                    Circle()
+                        .fill(.orange)
+                        .frame(width: 5, height: 5)
+                        .help(limitMessage)
+                }
                 // Un punto avisa de una ventana crítica que no es la principal (por
                 // ejemplo un tope por modelo al 100% con las 5 h todavía holgadas).
-                if let alert = snapshot?.hiddenAlert {
+                if let alert = snapshot?.hiddenAlert(at: now) {
                     Circle()
                         .fill(tint(alert.severity))
                         .frame(width: 5, height: 5)
@@ -96,6 +120,7 @@ struct SourceRowView: View {
                     .foregroundStyle(primary.severity == .normal ? .primary : tint(primary.severity))
                 LimitBarTrack(utilization: primary.utilization, tint: tint(primary.severity))
                     .frame(width: 56, height: 5)
+                    .opacity(isStale ? 0.55 : 1)
             } else if let message = statusMessage {
                 Text(message)
                     .font(.caption)
@@ -130,7 +155,7 @@ struct SourceRowView: View {
             }
 
             ForEach(windows) { window in
-                LimitBarView(window: window, now: now)
+                LimitBarView(window: window, now: now, isStale: isStale)
             }
 
             if let tokensRecord {
@@ -143,7 +168,7 @@ struct SourceRowView: View {
                     .foregroundStyle(.tertiary)
             }
 
-            if let message = statusMessage, snapshot?.primary != nil {
+            if let message = statusMessage, !windows.isEmpty {
                 Text(message)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -185,14 +210,10 @@ struct SourceRowView: View {
 
     // MARK: - Texto de estado
 
-    /// Un fallo con dato viejo se cuenta como antigüedad ("hace 12m"); el resto de estados
-    /// usan su mensaje de siempre. `nil` cuando todo está bien.
     var statusMessage: String? {
-        guard let snapshot else { return "Consultando…" }
-        if case .failed = snapshot.status, let lastGoodAt {
-            return Self.ago(lastGoodAt, now: now)
-        }
-        return snapshot.status.uiMessage
+        guard snapshot != nil else { return "Consultando…" }
+        let parts = [ageMessage, limitMessage].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private func tint(_ severity: LimitWindow.Severity) -> Color {
@@ -205,10 +226,10 @@ struct SourceRowView: View {
 
     private var summaryAccessibilityLabel: String {
         var parts = [source.displayName]
-        if let primary = snapshot?.primary {
+        if let primary = snapshot?.primary(at: now) {
             parts.append("\(primary.name): \(primary.percent) por ciento usado")
         }
-        if let alert = snapshot?.hiddenAlert {
+        if let alert = snapshot?.hiddenAlert(at: now) {
             parts.append("atención, \(alert.name) al \(alert.percent) por ciento")
         }
         if let message = statusMessage {

@@ -23,6 +23,14 @@ struct CollectorResult: Sendable {
     /// SOLO deltas nuevos desde la última corrida, ya agrupados por día.
     var records: [UsageRecord]
     var status: CollectorStatus
+    var modelRecords: [ModelUsageRecord]
+
+    init(records: [UsageRecord], status: CollectorStatus,
+         modelRecords: [ModelUsageRecord] = []) {
+        self.records = records
+        self.status = status
+        self.modelRecords = modelRecords
+    }
 
     static func empty(_ status: CollectorStatus) -> CollectorResult {
         CollectorResult(records: [], status: status)

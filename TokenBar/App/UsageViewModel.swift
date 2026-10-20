@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import Network
 import OSLog
 
 /// Estado observable de la app: corre los collectors cada 30 s, acumula en el store
@@ -19,6 +21,7 @@ final class UsageViewModel {
     private(set) var snapshot: UsageSnapshot = .empty
     private(set) var statuses: [AppSource: CollectorStatus] = [:]
     private(set) var lastUpdate: Date?
+    private(set) var lastErrorCount = 0
     private(set) var isRefreshing: Bool = false
 
     /// Límites en vivo de cada cuenta, indexados por fuente. Van por su propia cadencia
@@ -27,7 +30,21 @@ final class UsageViewModel {
 
     /// La ventana más comprometida de todas las cuentas: la que decide el color del ícono.
     var worstLimit: LimitWindow? {
-        limits.values.compactMap(\.worst).max { $0.utilization < $1.utilization }
+        let now = now()
+        return limits.values.compactMap { $0.worst(at: now) }
+            .max { $0.utilization < $1.utilization }
+    }
+
+    var todayTotalTokens: Int {
+        Self.totalTokens(in: snapshot.todayByApp)
+    }
+
+    var todayCostUSD: Double {
+        snapshot.todayByApp.values.reduce(0) { $0 + $1.costUSD }
+    }
+
+    nonisolated static func totalTokens(in records: [AppSource: UsageRecord]) -> Int {
+        records.values.reduce(0) { $0 + $1.totalTokens }
     }
 
     /// Persistido en `UserDefaults` bajo "showCost".
@@ -36,9 +53,12 @@ final class UsageViewModel {
     }
 
     private let store: UsageStore
+    /// Reparto por modelo para Estadísticas. `nil` en los tests que no lo ejercitan.
+    private let modelStore: ModelUsageStore?
     private let state: CollectorStateStore
     private let collectors: [any UsageCollector]
     private let limitsProviders: [any LimitsProvider]
+    private let operationDeadline: Duration
     /// Reloj inyectable para que los tests puedan avanzar el tiempo sin esperar.
     private let now: @Sendable () -> Date
     private let notifier = ThresholdNotifier()
@@ -50,19 +70,30 @@ final class UsageViewModel {
     private var lastGoodLimits: [AppSource: LimitsSnapshot] = [:]
     /// Cuándo se obtuvo el último snapshot `.ok` de cada fuente (para el "hace X").
     private(set) var lastGoodAt: [AppSource: Date] = [:]
+    private var definitiveFailures: [AppSource: Int] = [:]
+    private var loggedLimitStates: [AppSource: LimitLogState] = [:]
 
     /// Ciclo de refresco. Su existencia es la marca de "ya arrancó".
     private var cycle: Task<Void, Never>?
+    private var wakeObserver: NSObjectProtocol?
+    private var pathMonitor: NWPathMonitor?
+    private let pathQueue = DispatchQueue(label: "io.github.jhosgun.tokenbar.network-path")
+    private var previousPathWasSatisfied: Bool?
+    private var recoveryTask: Task<Void, Never>?
 
     init(store: UsageStore,
+         modelStore: ModelUsageStore? = nil,
          state: CollectorStateStore,
          collectors: [any UsageCollector],
          limitsProviders: [any LimitsProvider] = [],
+         operationDeadline: Duration = .seconds(30),
          now: @escaping @Sendable () -> Date = Date.init) {
         self.store = store
+        self.modelStore = modelStore
         self.state = state
         self.collectors = collectors
         self.limitsProviders = limitsProviders
+        self.operationDeadline = operationDeadline
         self.now = now
         // `didSet` no dispara en init, así que esto no reescribe el default.
         self.showCost = UserDefaults.standard.bool(forKey: Self.showCostKey)
@@ -75,22 +106,26 @@ final class UsageViewModel {
     func start() {
         guard cycle == nil else { return }
 
+        observeRecoveryEvents()
+
         // El permiso se pide solo si la notificación de umbral ya está activada: en el
         // primer arranque, con la función apagada, no se le muestra el diálogo a nadie.
         // Si la activa después, Preferencias dispara la autorización por su cuenta.
         // Va en su propia tarea: si el usuario deja el diálogo abierto, el ciclo de datos
         // sigue corriendo.
         if ThresholdNotifier.isEnabled {
-            Task { [notifier] in await notifier.requestAuthorizationIfNeeded() }
+            Task { [notifier] in await notifier.requestAuthorization() }
         }
 
         cycle = Task { [weak self] in
             guard let self else { return }
             await self.store.load()
+            await self.modelStore?.load()
             await self.state.load()
             // Una sola poda por arranque; la app es de larga vida pero 90 días de margen
             // hacen que un solo pase al día sea de sobra.
             await self.store.purge(olderThanDays: Self.retentionDays, summaryDays: Self.summaryRetentionDays)
+            await self.modelStore?.purge()
 
             while !Task.isCancelled {
                 await self.refresh()
@@ -100,6 +135,47 @@ final class UsageViewModel {
                     break   // cancelado
                 }
             }
+        }
+    }
+
+    private func observeRecoveryEvents() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.scheduleRecovery() }
+        }
+
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let isSatisfied = path.status == .satisfied
+                defer { self.previousPathWasSatisfied = isSatisfied }
+                if self.previousPathWasSatisfied == false, isSatisfied {
+                    self.scheduleRecovery()
+                }
+            }
+        }
+        pathMonitor = monitor
+        monitor.start(queue: pathQueue)
+    }
+
+    private func scheduleRecovery() {
+        recoveryTask?.cancel()
+        recoveryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(5))
+            } catch {
+                return
+            }
+            guard let self else { return }
+            let now = self.now()
+            for source in self.limitGates.keys {
+                self.limitGates[source]?.resetCadenceUnlessBackingOff(now: now)
+            }
+            await self.refresh(forceLimits: true)
         }
     }
 
@@ -115,16 +191,25 @@ final class UsageViewModel {
         // Conteo y límites (solo los que tocan) van en paralelo: son fuentes independientes
         // y ninguna debe retrasar a la otra.
         let dueProviders = limitsProvidersToFetch(force: forceLimits)
-        async let limitsTask = Self.fetchLimits(from: dueProviders)
-        let results = await Self.collect(from: collectors)
+        async let limitsTask = Self.fetchLimits(from: dueProviders, deadline: operationDeadline)
+        let results = await Self.collect(from: collectors, deadline: operationDeadline)
 
         var newRecords: [UsageRecord] = []
+        var newModelRecords: [ModelUsageRecord] = []
+        var successfulSources: Set<AppSource> = []
         for (source, result) in results {
             statuses[source] = result.status
             newRecords.append(contentsOf: result.records)
+            newModelRecords.append(contentsOf: result.modelRecords)
+            if result.status == .ok {
+                successfulSources.insert(source)
+            }
         }
 
         let delta = await store.apply(newRecords)
+        // En el mismo paso que `records`, para que el total por herramienta y su reparto por
+        // modelo no se separen si la app se cierra entre un ciclo y el siguiente.
+        await modelStore?.apply(newModelRecords)
         // El orden importa: primero los tokens (`apply` escribe `usage.json` de forma
         // atómica), y solo después la marca de "ya consumido" (`state.json`: cursores e ids
         // vistos). Al revés, un crash entre ambas escrituras dejaría el estado diciendo que
@@ -137,8 +222,18 @@ final class UsageViewModel {
         let now = self.now()
         for snapshot in await limitsTask {
             applyLimits(snapshot, now: now)
+            if snapshot.status == .ok {
+                successfulSources.insert(snapshot.source)
+            }
         }
-        lastUpdate = now
+        // Los errores se cuentan de los estados persistidos, no de este ciclo: un proveedor
+        // de límites caído no se reconsulta en 5 min y su fallo debe seguir contando.
+        var failedSources = Set(statuses.filter { $0.value != .ok }.keys)
+        failedSources.formUnion(limits.filter { $0.value.status != .ok }.keys)
+        lastErrorCount = failedSources.count
+        if !successfulSources.isEmpty {
+            lastUpdate = now
+        }
 
         if delta > 0 {
             log.debug("refresh: +\(delta) tokens")
@@ -146,7 +241,16 @@ final class UsageViewModel {
 
         // De último: todo lo que pinta la UI ya se publicó. `evaluate` no bloquea porque la
         // autorización se pidió en `start()`; si no está habilitada, sale de inmediato.
-        await notifier.evaluate(todayTotal: snapshot.todayTotalTokens, day: DayKey.today())
+        await notifier.evaluate(todayTotal: todayTotalTokens, day: DayKey.today())
+    }
+
+    /// Series de los últimos `days` días (terminando hoy) para la ventana de Estadísticas.
+    func statsData(days: Int, grouping: StatsGrouping) async -> StatsData {
+        let range = DayKey.lastDays(days, endingAt: now())
+        guard let firstDay = range.first else { return StatsData(days: [], series: []) }
+        let usage = await store.records(fromDay: firstDay)
+        let models = await modelStore?.records(fromDay: firstDay) ?? []
+        return StatsBuilder.build(days: range, usage: usage, models: models, grouping: grouping)
     }
 
     /// Proveedores de límites a los que toca consultar en este ciclo, según cadencia y backoff.
@@ -166,6 +270,7 @@ final class UsageViewModel {
 
         switch snapshot.status {
         case .ok:
+            definitiveFailures[source] = 0
             limits[source] = snapshot
             lastGoodLimits[source] = snapshot
             // `dataAsOf` es la fecha real del dato (una caché, un CLI que ya corrió);
@@ -175,17 +280,25 @@ final class UsageViewModel {
             gate.recordAttempt(now: now)
 
         case .notConfigured, .invalidCredentials:
-            // Son estados definitivos (no hay token, o el token no sirve): la fila se vacía.
-            limits[source] = .empty(source, snapshot.status)
-            lastGoodLimits[source] = nil
-            lastGoodAt[source] = nil
+            let failures = definitiveFailures[source, default: 0] + 1
+            definitiveFailures[source] = failures
+            if failures == 1, var good = lastGoodLimits[source], lastGoodAt[source] != nil {
+                good.status = snapshot.status
+                limits[source] = good
+            } else {
+                limits[source] = .empty(source, snapshot.status)
+                lastGoodLimits[source] = nil
+                lastGoodAt[source] = nil
+            }
             gate.recordAttempt(now: now)
 
         case .failed:
+            definitiveFailures[source] = 0
             applyTransientFailure(snapshot, now: now, gate: &gate)
         }
 
         limitGates[source] = gate
+        logLimitTransition(snapshot, gate: gate, now: now)
     }
 
     /// Un fallo transitorio (429, red, 5xx, respuesta no reconocida) no tira lo que ya se
@@ -220,13 +333,33 @@ final class UsageViewModel {
         }
     }
 
+    private func logLimitTransition(_ snapshot: LimitsSnapshot, gate: LimitsGate, now: Date) {
+        let state = LimitLogState(status: snapshot.status, rateLimited: snapshot.rateLimited)
+        let line = LimitLogState.transitionLine(
+            source: snapshot.source,
+            previous: loggedLimitStates[snapshot.source],
+            current: state,
+            message: snapshot.status.uiMessage,
+            nextAttempt: gate.nextAttempt(after: now)
+        )
+        loggedLimitStates[snapshot.source] = state
+        guard let line else { return }
+        log.notice("\(line, privacy: .public)")
+    }
+
     /// Los collectors son `Sendable` y corren fuera del MainActor.
     private static func collect(
-        from collectors: [any UsageCollector]
+        from collectors: [any UsageCollector],
+        deadline: Duration
     ) async -> [(AppSource, CollectorResult)] {
         await withTaskGroup(of: (AppSource, CollectorResult).self) { group in
             for collector in collectors {
-                group.addTask { (collector.source, await collector.collect()) }
+                group.addTask {
+                    let result = await NetworkDeadline.run(budget: deadline) {
+                        await collector.collect()
+                    } ?? .empty(.failed("Tiempo de espera agotado"))
+                    return (collector.source, result)
+                }
             }
             var results: [(AppSource, CollectorResult)] = []
             for await result in group {
@@ -238,11 +371,16 @@ final class UsageViewModel {
 
     /// Los proveedores de límites también son `Sendable` y corren fuera del MainActor.
     private static func fetchLimits(
-        from providers: [any LimitsProvider]
+        from providers: [any LimitsProvider],
+        deadline: Duration
     ) async -> [LimitsSnapshot] {
         await withTaskGroup(of: LimitsSnapshot.self) { group in
             for provider in providers {
-                group.addTask { await provider.fetch() }
+                group.addTask {
+                    await NetworkDeadline.run(budget: deadline) {
+                        await provider.fetch()
+                    } ?? .empty(provider.source, .failed("Tiempo de espera agotado"))
+                }
             }
             var results: [LimitsSnapshot] = []
             for await result in group {
@@ -250,6 +388,40 @@ final class UsageViewModel {
             }
             return results
         }
+    }
+}
+
+/// Estado de una fuente de límites tal como se loguea (E3). `Equatable` decide qué
+/// cuenta como transición: el status (con su mensaje, si trae) y si fue 429. No es
+/// `private` a propósito: los tests fijan la línea de rastro.
+struct LimitLogState: Equatable {
+    var status: CollectorStatus
+    var rateLimited: Bool
+
+    var label: String {
+        switch status {
+        case .ok: "ok"
+        case .notConfigured: "no configurado"
+        case .invalidCredentials: "credenciales inválidas"
+        case .failed: "fallo"
+        }
+    }
+
+    /// Línea de `log.notice` para un cambio de estado de una fuente de límites (E3):
+    /// fuente, estado, mensaje, si fue 429 y próximo intento. `nil` si el estado no
+    /// cambió — solo transiciones, no cada ciclo. Función pura para testear la decisión
+    /// y el contenido sin capturar OSLog.
+    static func transitionLine(
+        source: AppSource,
+        previous: LimitLogState?,
+        current: LimitLogState,
+        message: String?,
+        nextAttempt: Date?
+    ) -> String? {
+        guard previous != current else { return nil }
+        let attempt = nextAttempt.map { $0.formatted(.iso8601) } ?? "ahora"
+        return "cuota fuente=\(source.displayName) estado=\(current.label) "
+            + "mensaje=\(message ?? "—") 429=\(current.rateLimited ? "sí" : "no") próximo=\(attempt)"
     }
 }
 
@@ -293,6 +465,19 @@ struct LimitsGate: Sendable {
     /// ¿Puede consultar un refresh manual? Ignora la cadencia, respeta el backoff.
     func canForce(now: Date) -> Bool {
         !isBackingOff(now: now)
+    }
+
+    func nextAttempt(after now: Date) -> Date? {
+        if let hardBackoffUntil, hardBackoffUntil > now { return hardBackoffUntil }
+        guard let lastAttempt else { return nil }
+        let delay = max(step, Self.interval)
+        let next = lastAttempt.addingTimeInterval(delay)
+        return next > now ? next : nil
+    }
+
+    mutating func resetCadenceUnlessBackingOff(now: Date) {
+        guard !isBackingOff(now: now) else { return }
+        lastAttempt = nil
     }
 
     /// Registra un intento sin 429: resetea el backoff.

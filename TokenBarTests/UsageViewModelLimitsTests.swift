@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import Testing
 
 @testable import TokenBar
@@ -35,6 +36,8 @@ private actor ScriptedLimitsProvider: LimitsProvider {
 @MainActor
 private func makeViewModel(
     providers: [any LimitsProvider],
+    collectors: [any UsageCollector] = [],
+    deadline: Duration = .seconds(30),
     clock: Clock
 ) -> (viewModel: UsageViewModel, directory: URL) {
     let directory = FileManager.default.temporaryDirectory
@@ -42,11 +45,38 @@ private func makeViewModel(
     let viewModel = UsageViewModel(
         store: UsageStore(directory: directory),
         state: CollectorStateStore(directory: directory),
-        collectors: [],
+        collectors: collectors,
         limitsProviders: providers,
+        operationDeadline: deadline,
         now: { clock.now }
     )
     return (viewModel, directory)
+}
+
+private struct HangingCollector: UsageCollector {
+    let source: AppSource
+
+    func collect() async -> CollectorResult {
+        await withUnsafeContinuation { (_: UnsafeContinuation<Void, Never>) in }
+        return .empty(.ok)
+    }
+}
+
+private struct OkCollector: UsageCollector {
+    let source: AppSource
+
+    func collect() async -> CollectorResult {
+        .empty(.ok)
+    }
+}
+
+private struct HangingLimitsProvider: LimitsProvider {
+    let source: AppSource
+
+    func fetch() async -> LimitsSnapshot {
+        await withUnsafeContinuation { (_: UnsafeContinuation<Void, Never>) in }
+        return .empty(source, .ok)
+    }
 }
 
 private func okSnapshot(_ source: AppSource = .claudeCode) -> LimitsSnapshot {
@@ -264,13 +294,14 @@ struct UsageViewModelLimitsTests {
         #expect(vm.limits[.claudeCode]?.status == .ok)
     }
 
-    @Test("invalidCredentials sí vacía la fila")
+    @Test("el primer invalidCredentials conserva la fila y el segundo la vacía")
     @MainActor
-    func credencialesInvalidasVacianLaFila() async {
+    func credencialesInvalidasRequierenConfirmacion() async {
         let t0 = Date(timeIntervalSince1970: 1_000_000)
         let clock = Clock(t0)
         let provider = ScriptedLimitsProvider(source: .claudeCode, script: [
             okSnapshot(),
+            .empty(.claudeCode, .invalidCredentials),
             .empty(.claudeCode, .invalidCredentials)
         ])
         let (vm, dir) = makeViewModel(providers: [provider], clock: clock)
@@ -281,8 +312,239 @@ struct UsageViewModelLimitsTests {
 
         clock.now = t0.addingTimeInterval(301)
         await vm.refresh()
+        #expect(vm.limits[.claudeCode]?.windows.count == 1)
+        #expect(vm.limits[.claudeCode]?.status == .invalidCredentials)
+        #expect(vm.lastGoodAt[.claudeCode] == t0)
+
+        clock.now = t0.addingTimeInterval(602)
+        await vm.refresh()
         #expect(vm.limits[.claudeCode]?.windows.isEmpty == true)
         #expect(vm.limits[.claudeCode]?.status == .invalidCredentials)
+        #expect(vm.lastGoodAt[.claudeCode] == nil)
+    }
+
+    @Test("la edad aparece con estado ok cuando el dato tiene más de diez minutos")
+    @MainActor
+    func edadVisibleConEstadoOk() async {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        let clock = Clock(t0)
+        var old = okSnapshot()
+        old.dataAsOf = t0.addingTimeInterval(-11 * 60)
+        let provider = ScriptedLimitsProvider(source: .claudeCode, script: [old])
+        let (vm, dir) = makeViewModel(providers: [provider], clock: clock)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        await vm.refresh()
+        let row = SourceRowView(
+            source: .claudeCode,
+            snapshot: vm.limits[.claudeCode],
+            record: nil,
+            series: [],
+            tokensStatus: .ok,
+            showCost: false,
+            lastGoodAt: vm.lastGoodAt[.claudeCode],
+            now: t0,
+            isExpanded: .constant(false)
+        )
+        #expect(row.statusMessage == "hace 11m")
+    }
+
+    @Test("un collector y un proveedor colgados no bloquean el refresco")
+    @MainActor
+    func plazoExteriorDesbloqueaRefresh() async {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        let clock = Clock(t0)
+        let (vm, dir) = makeViewModel(
+            providers: [HangingLimitsProvider(source: .claudeCode)],
+            collectors: [HangingCollector(source: .cursor)],
+            deadline: .milliseconds(20),
+            clock: clock
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        await vm.refresh()
+
+        #expect(!vm.isRefreshing)
+        #expect(vm.statuses[.cursor] == .failed("Tiempo de espera agotado"))
+        #expect(vm.limits[.claudeCode]?.status == .failed("Tiempo de espera agotado"))
+        #expect(vm.lastUpdate == nil)
+        #expect(vm.lastErrorCount == 2)
+    }
+
+    @Test("recuperar wake o red abre la cadencia pero respeta el backoff")
+    func recuperacionRespetaBackoff() {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        var normal = LimitsGate()
+        normal.recordAttempt(now: t0)
+        normal.resetCadenceUnlessBackingOff(now: t0.addingTimeInterval(10))
+        #expect(normal.canForce(now: t0.addingTimeInterval(10)))
+
+        var limited = LimitsGate()
+        limited.recordRateLimit(now: t0, retryAfter: t0.addingTimeInterval(120))
+        limited.resetCadenceUnlessBackingOff(now: t0.addingTimeInterval(10))
+        #expect(!limited.canForce(now: t0.addingTimeInterval(10)))
+    }
+
+    @Test("el próximo intento respeta Retry-After, la escalera y la cadencia")
+    func proximoIntento() {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+
+        // Nunca consultado: toca ya.
+        var virgen = LimitsGate()
+        #expect(virgen.nextAttempt(after: t0) == nil)
+
+        // Cadencia normal: 5 minutos desde el último intento.
+        var cadencia = LimitsGate()
+        cadencia.recordAttempt(now: t0)
+        #expect(cadencia.nextAttempt(after: t0) == t0.addingTimeInterval(300))
+
+        // Escalera de 429 sin Retry-After: primer peldaño, 5 minutos.
+        var escalera = LimitsGate()
+        escalera.recordRateLimit(now: t0, retryAfter: nil)
+        #expect(escalera.nextAttempt(after: t0) == t0.addingTimeInterval(300))
+
+        // Retry-After explícito manda sobre la escalera…
+        var conRetryAfter = LimitsGate()
+        conRetryAfter.recordRateLimit(now: t0, retryAfter: t0.addingTimeInterval(120))
+        #expect(conRetryAfter.nextAttempt(after: t0) == t0.addingTimeInterval(120))
+        // …hasta que vence: entonces toca ya.
+        #expect(conRetryAfter.nextAttempt(after: t0.addingTimeInterval(999)) == nil)
+    }
+
+    @Test("el rastro de límites anota solo transiciones de estado")
+    func rastroSoloEnTransiciones() {
+        let ok = LimitLogState(status: .ok, rateLimited: false)
+        let fallo = LimitLogState(status: .failed("Sin conexión"), rateLimited: false)
+        let limitado = LimitLogState(status: .failed("Cuota de consultas"), rateLimited: true)
+
+        // El primer estado visto deja línea.
+        #expect(LimitLogState.transitionLine(
+            source: .claudeCode, previous: nil, current: ok,
+            message: nil, nextAttempt: nil) != nil)
+        // Cada cambio también.
+        #expect(LimitLogState.transitionLine(
+            source: .claudeCode, previous: ok, current: fallo,
+            message: "Sin conexión", nextAttempt: Date(timeIntervalSince1970: 1_000_120)) != nil)
+        // El estado repetido, no: solo transiciones, no cada ciclo.
+        #expect(LimitLogState.transitionLine(
+            source: .claudeCode, previous: fallo, current: fallo,
+            message: "Sin conexión", nextAttempt: nil) == nil)
+        #expect(LimitLogState.transitionLine(
+            source: .claudeCode, previous: ok, current: ok,
+            message: nil, nextAttempt: nil) == nil)
+        // Un 429 (aunque el texto del fallo sea el mismo) sí es transición.
+        #expect(LimitLogState.transitionLine(
+            source: .claudeCode, previous: fallo, current: limitado,
+            message: "Cuota de consultas", nextAttempt: nil) != nil)
+    }
+
+    @Test("la línea de rastro trae fuente, estado, mensaje, 429 y próximo intento")
+    func lineaDeRastro() {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        let limitado = LimitLogState(status: .failed("Cuota de consultas"), rateLimited: true)
+        let linea = LimitLogState.transitionLine(
+            source: .claudeCode,
+            previous: LimitLogState(status: .ok, rateLimited: false),
+            current: limitado,
+            message: "Cuota de consultas",
+            nextAttempt: t0.addingTimeInterval(120)
+        )
+        #expect(linea == "cuota fuente=Claude Code estado=fallo mensaje=Cuota de consultas "
+                     + "429=sí próximo=\(t0.addingTimeInterval(120).formatted(.iso8601))")
+
+        // Sin mensaje (.ok) y sin próximo intento: guion y "ahora", no huecos vacíos.
+        let okLinea = LimitLogState.transitionLine(
+            source: .codex,
+            previous: nil,
+            current: LimitLogState(status: .ok, rateLimited: false),
+            message: nil,
+            nextAttempt: nil
+        )
+        #expect(okLinea == "cuota fuente=Codex estado=ok mensaje=— 429=no próximo=ahora")
+    }
+
+    @Test("el total de hoy suma cualquier fuente presente en el snapshot")
+    func totalDinamico() {
+        let records: [AppSource: UsageRecord] = [
+            .claudeCode: UsageRecord(source: .claudeCode, day: "2026-10-04", inputTokens: 10),
+            .codex: UsageRecord(source: .codex, day: "2026-10-04", outputTokens: 25)
+        ]
+        #expect(UsageViewModel.totalTokens(in: records) == 35)
+    }
+
+    @Test("la línea de tokens no fabrica cero cuando el collector falla")
+    @MainActor
+    func visibilidadDeTokens() {
+        let failed = SourceRowView(
+            source: .claudeCode,
+            snapshot: nil,
+            record: UsageRecord(source: .claudeCode, day: "2026-10-04"),
+            series: [],
+            tokensStatus: .failed("Sin datos"),
+            showCost: false,
+            lastGoodAt: nil,
+            now: Date(),
+            isExpanded: .constant(false)
+        )
+        #expect(failed.tokensRecord == nil)
+
+        let validZero = SourceRowView(
+            source: .claudeCode,
+            snapshot: nil,
+            record: UsageRecord(source: .claudeCode, day: "2026-10-04"),
+            series: [],
+            tokensStatus: .ok,
+            showCost: false,
+            lastGoodAt: nil,
+            now: Date(),
+            isExpanded: .constant(false)
+        )
+        #expect(validZero.tokensRecord?.totalTokens == 0)
+    }
+
+    @Test("lastUpdate no avanza cuando todas las fuentes fallan")
+    @MainActor
+    func lastUpdateSoloAvanzaConExito() async {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        let clock = Clock(t0)
+        let provider = ScriptedLimitsProvider(source: .claudeCode, script: [
+            okSnapshot(),
+            .empty(.claudeCode, .failed("Sin conexión"))
+        ])
+        let (vm, dir) = makeViewModel(providers: [provider], clock: clock)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        await vm.refresh()
+        #expect(vm.lastUpdate == t0)
+
+        clock.now = t0.addingTimeInterval(301)
+        await vm.refresh()
+        #expect(vm.lastUpdate == t0)
+        #expect(vm.lastErrorCount == 1)
+    }
+
+    @Test("el conteo de errores sigue contando un proveedor caído que no se reconsulta en el ciclo")
+    @MainActor
+    func erroresPersistentesEntreCiclos() async {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        let clock = Clock(t0)
+        let provider = ScriptedLimitsProvider(source: .claudeCode, script: [
+            .empty(.claudeCode, .failed("Sin conexión"))
+        ])
+        let (vm, dir) = makeViewModel(
+            providers: [provider], collectors: [OkCollector(source: .codex)], clock: clock)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        await vm.refresh()
+        #expect(vm.lastErrorCount == 1)
+
+        // 30 s después el proveedor no toca (cadencia de 5 min): solo responde el collector
+        // sano, pero el fallo sigue vigente en `limits` y debe seguir en el pie.
+        clock.now = t0.addingTimeInterval(30)
+        await vm.refresh()
+        #expect(vm.limits[.claudeCode]?.status == .failed("Sin conexión"))
+        #expect(vm.lastErrorCount == 1)
+        #expect(vm.lastUpdate == t0.addingTimeInterval(30))
     }
 }
 

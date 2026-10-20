@@ -33,32 +33,57 @@ final class ThresholdNotifier {
         set { UserDefaults.standard.set(max(1, newValue), forKey: thresholdKey) }
     }
 
+    /// Permiso de notificaciones visto desde la app. No se cachea: cada consulta lee el
+    /// estado vigente del sistema, así un cambio hecho en Ajustes del sistema se refleja
+    /// en la siguiente evaluación o apertura de Preferencias sin reiniciar.
+    enum PermissionStatus: Sendable {
+        case allowed
+        case denied
+        case notDetermined
+        case unavailable
+    }
+
     private let log = Logger(subsystem: "io.github.jhosgun.tokenbar", category: "notify")
-    private var didRequestAuthorization = false
-    private var isAuthorized = false
 
     init() {}
 
-    /// Pide autorización (.alert, .sound) una sola vez por instancia. El sistema solo muestra
-    /// el diálogo la primera vez de por vida; en arranques posteriores devuelve el permiso
-    /// vigente sin molestar al usuario. Nunca lanza.
-    func requestAuthorizationIfNeeded() async {
-        guard !didRequestAuthorization else { return }
-        didRequestAuthorization = true
+    /// Mapea el estado de autorización del sistema al vocabulario de la app. Función
+    /// pura para poder testear el mapeo sin tocar el centro de notificaciones.
+    static func permission(from status: UNAuthorizationStatus) -> PermissionStatus {
+        switch status {
+        case .authorized, .provisional, .ephemeral: .allowed
+        case .denied: .denied
+        case .notDetermined: .notDetermined
+        @unknown default: .unavailable
+        }
+    }
 
-        guard let center = Self.center() else { return }
+    /// Consulta el permiso vigente sin pedirlo. Nunca lanza.
+    func permissionStatus() async -> PermissionStatus {
+        guard let center = Self.center() else { return .unavailable }
+        let settings = await center.notificationSettings()
+        return Self.permission(from: settings.authorizationStatus)
+    }
+
+    /// Pide autorización (.alert, .sound). El sistema solo muestra el diálogo la primera
+    /// vez de por vida; en arranques posteriores devuelve el permiso vigente sin molestar
+    /// al usuario. Devuelve si quedó autorizado. Nunca lanza.
+    @discardableResult
+    func requestAuthorization() async -> Bool {
+        guard let center = Self.center() else { return false }
         do {
-            isAuthorized = try await center.requestAuthorization(options: [.alert, .sound])
+            return try await center.requestAuthorization(options: [.alert, .sound])
         } catch {
-            isAuthorized = false
             log.error("autorización rechazada: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
     /// Llamar después de cada refresh con el total de HOY y el día actual ("yyyy-MM-dd").
     ///
     /// Dispara la notificación solo si está habilitada, el total alcanza el umbral y no se
-    /// notificó ya ese día. Sin permiso del usuario no hace nada.
+    /// notificó ya ese día. Consulta el permiso del sistema en cada evaluación (no se fía
+    /// de un valor cacheado): si está denegado, no notifica; si todavía no se pidió, lo pide.
     ///
     /// Anti-spam: el día notificado queda guardado en "notifyLastFiredDay". Si el usuario
     /// BAJA el umbral después de que ya se notificó hoy, NO se vuelve a notificar hasta
@@ -70,8 +95,16 @@ final class ThresholdNotifier {
         guard todayTotal >= threshold else { return }
         guard UserDefaults.standard.string(forKey: Self.lastFiredDayKey) != day else { return }
 
-        await requestAuthorizationIfNeeded()
-        guard isAuthorized, let center = Self.center() else { return }
+        guard let center = Self.center() else { return }
+        let settings = await center.notificationSettings()
+        switch Self.permission(from: settings.authorizationStatus) {
+        case .allowed:
+            break
+        case .notDetermined:
+            guard await requestAuthorization() else { return }
+        case .denied, .unavailable:
+            return
+        }
 
         let content = UNMutableNotificationContent()
         content.title = "TokenBar"

@@ -20,6 +20,8 @@ struct CursorLimitsProvider: LimitsProvider {
         var utilization: Double?
         var resetsAt: Date
         var extraWindows: [LimitWindow]
+        /// B16: un plan ilimitado no tiene barras que pintar, pero sí etiqueta.
+        var isUnlimited: Bool = false
     }
 
     private enum Response: Sendable {
@@ -40,6 +42,9 @@ struct CursorLimitsProvider: LimitsProvider {
 
     private let databaseURL: URL
     private let session: URLSession
+    /// Credencial del ciclo anterior, solo en memoria: un fallo transitorio de lectura
+    /// no tumba la fila si ya había una (ver `CursorSession.CredentialCache`).
+    private let credentials = CursorSession.CredentialCache()
 
     init(databaseURL: URL = CursorLimitsProvider.defaultDatabaseURL,
          session: URLSession = .shared) {
@@ -48,8 +53,14 @@ struct CursorLimitsProvider: LimitsProvider {
     }
 
     func fetch() async -> LimitsSnapshot {
-        guard let credential = CursorSession.credential(from: databaseURL) else {
+        let credential: CursorSession.Credential
+        switch await credentials.credentialResult(from: databaseURL) {
+        case .success(let value): credential = value
+        case .failure(.missingDatabase), .failure(.missingKey):
             return .empty(source, .notConfigured)
+        case .failure(.readFailed(let code)):
+            // B10: un error de lectura no es "no configurado".
+            return .empty(source, .failed(CursorSession.readFailureMessage(code: code)))
         }
         if credential.isExpired { return .empty(source, .invalidCredentials) }
 
@@ -67,6 +78,12 @@ struct CursorLimitsProvider: LimitsProvider {
 
         guard let summary = Self.parseSummary(summaryData) else {
             return .empty(source, .failed("Respuesta no reconocida"))
+        }
+
+        // B16: un plan ilimitado es válido aunque no tenga ninguna barra.
+        if summary.isUnlimited {
+            return LimitsSnapshot(source: source, windows: [],
+                                  planLabel: summary.planLabel, status: .ok)
         }
 
         guard let utilization = summary.utilization else {
@@ -95,7 +112,8 @@ struct CursorLimitsProvider: LimitsProvider {
         do {
             let (data, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse {
-                if http.statusCode == 401 || http.statusCode == 403 { return .unauthorized }
+                if http.statusCode == 401 { return .unauthorized }
+                if http.statusCode == 403 { return .failed("HTTP 403") }   // B13: transitorio
                 if http.statusCode == 429 { return .rateLimited(RetryAfter.date(from: http)) }
                 guard (200..<300).contains(http.statusCode) else {
                     return .failed("HTTP \(http.statusCode)")
@@ -104,7 +122,7 @@ struct CursorLimitsProvider: LimitsProvider {
             return .success(data)
         } catch {
             Self.log.error("fallo de red: \(error.localizedDescription, privacy: .public)")
-            return .failed("Sin respuesta")
+            return .failed("Sin conexión")
         }
     }
 
@@ -114,12 +132,24 @@ struct CursorLimitsProvider: LimitsProvider {
     static func parseSummary(_ data: Data) -> Summary? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let planLabel = nonEmptyString(root["membershipType"]),
-              let cycleEnd = date(root["billingCycleEnd"]),
-              let individual = root["individualUsage"] as? [String: Any] else {
+              let cycleEnd = date(root["billingCycleEnd"]) else {
             return nil
         }
 
-        let plan = individual["plan"] as? [String: Any]
+        // B16: en planes de equipo el consumo vive en `teamUsage`, no en `individualUsage`.
+        let limitType = nonEmptyString(root["limitType"])
+        let usage = (limitType == "team" ? root["teamUsage"] : root["individualUsage"])
+            as? [String: Any] ?? (root["individualUsage"] as? [String: Any])
+        guard let usage else { return nil }
+
+        let plan = usage["plan"] as? [String: Any]
+
+        // B16: plan ilimitado → sin barras, pero con etiqueta.
+        if bool(root["isUnlimited"]) == true || bool(plan?["isUnlimited"]) == true {
+            return Summary(planLabel: planLabel, utilization: nil,
+                           resetsAt: cycleEnd, extraWindows: [], isUnlimited: true)
+        }
+
         let utilization = utilization(from: plan)
         var extraWindows: [LimitWindow] = []
 
@@ -140,8 +170,8 @@ struct CursorLimitsProvider: LimitsProvider {
 
         // Cursor movió este bucket de `onDemand` a `overall` en 2026. Solo se muestra
         // cuando declara un límite explícito; gasto sin tope no es una barra honesta.
-        let extra = (individual["overall"] as? [String: Any])
-            ?? (individual["onDemand"] as? [String: Any])
+        let extra = (usage["overall"] as? [String: Any])
+            ?? (usage["onDemand"] as? [String: Any])
         if let extra,
            bool(extra["enabled"]) == true,
            let used = number(extra["used"]),
@@ -163,8 +193,14 @@ struct CursorLimitsProvider: LimitsProvider {
         if let percent = number(bucket["totalPercentUsed"]) {
             return LimitWindow.utilization(fromPercent: percent)
         }
-        guard let used = number(bucket["used"]),
-              let remaining = number(bucket["remaining"]), remaining >= 0 else {
+        guard let used = number(bucket["used"]) else { return nil }
+        // B11: sin `totalPercentUsed`, el tope es `breakdown.total` (incluye el bono), no
+        // `used + remaining` — que ignora el bono y muestra un 100 % falso.
+        if let breakdown = bucket["breakdown"] as? [String: Any],
+           let total = number(breakdown["total"]), total > 0 {
+            return LimitWindow.utilization(used: used, cap: total)
+        }
+        guard let remaining = number(bucket["remaining"]), remaining >= 0 else {
             return nil
         }
         return LimitWindow.utilization(used: used, cap: used + remaining)
@@ -209,7 +245,7 @@ struct CursorLimitsProvider: LimitsProvider {
         CursorSession.isExpired(token, now: now)
     }
 
-    static func readAccessToken(from url: URL) -> String? {
-        CursorSession.readAccessToken(from: url)
+    static func readAccessToken(from url: URL) async -> String? {
+        await CursorSession.readAccessToken(from: url)
     }
 }

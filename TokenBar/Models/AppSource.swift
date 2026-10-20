@@ -13,6 +13,9 @@ enum AppSource: String, Codable, CaseIterable, Identifiable, Sendable {
     static let limitsCases: [AppSource] = [
         .claudeCode, .cursor, .antigravity, .codex, .commandCode, .opencode
     ]
+    static let tokenSources: [AppSource] = [
+        .claudeCode, .cursor, .codex, .commandCode, .opencode
+    ]
 
     var id: String { rawValue }
 
@@ -30,7 +33,7 @@ enum AppSource: String, Codable, CaseIterable, Identifiable, Sendable {
 
     /// Bundle id de la app de escritorio de la herramienta, cuando existe: de ahí sale su
     /// logo real. Las herramientas que solo son CLI (Command Code, OpenCode, el `agy` de
-    /// Antigravity) no tienen app instalada y caen en su SF Symbol.
+    /// Antigravity) no tienen app instalada y usan el logo empaquetado en el catálogo.
     var bundleIdentifier: String? {
         switch self {
         case .claudeCode: return "com.anthropic.claudefordesktop"
@@ -40,15 +43,9 @@ enum AppSource: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Si la herramienta tiene de dónde leer tokens consumidos. Antigravity no persiste
-    /// consumo en ninguna parte, y Codex, Command Code y OpenCode solo exponen cuota: sus
-    /// filas muestran ventanas, no tokens. Un día en cero **sí** es consumo válido, así que
-    /// esto no depende de cuántos tokens haya hoy.
+    /// Si la herramienta tiene de dónde leer tokens consumidos.
     var hasTokenSource: Bool {
-        switch self {
-        case .claudeCode, .cursor: return true
-        case .antigravity, .codex, .commandCode, .opencode: return false
-        }
+        Self.tokenSources.contains(self)
     }
 
     /// SF Symbol que representa la app en la lista.

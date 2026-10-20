@@ -10,10 +10,21 @@ import SwiftUI
 /// de los que ya trae.
 struct WeekSummaryView: View {
     let snapshot: UsageSnapshot
+    @State private var selectedDay: String?
 
     private var days: [DayTotal] { snapshot.weekTotals }
     private var maxTokens: Int { days.map(\.tokens).max() ?? 0 }
     private var today: String { DayKey.today() }
+    private var selectedDayTotal: DayTotal? { days.first { $0.day == selectedDay } }
+
+    init(snapshot: UsageSnapshot, selectedDay: String? = nil) {
+        self.snapshot = snapshot
+        _selectedDay = State(
+            initialValue: selectedDay.flatMap { selected in
+                snapshot.weekTotals.contains { $0.day == selected } ? selected : nil
+            }
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -34,7 +45,7 @@ struct WeekSummaryView: View {
 
             Spacer(minLength: 4)
 
-            Text(totalsText)
+            Text(Self.headerText(snapshot: snapshot, selectedDay: selectedDayTotal))
                 .font(.caption2)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
@@ -44,8 +55,17 @@ struct WeekSummaryView: View {
         .accessibilityElement(children: .combine)
     }
 
-    private var totalsText: String {
-        "\(TokenFormatter.short(snapshot.weekTotalTokens)) · prom. \(TokenFormatter.short(snapshot.weekAverageTokens))"
+    nonisolated static func headerText(snapshot: UsageSnapshot, selectedDay: DayTotal?) -> String {
+        guard let selectedDay else {
+            return "\(TokenFormatter.short(snapshot.weekTotalTokens)) · prom. \(TokenFormatter.short(snapshot.weekAverageTokens))"
+        }
+        guard let date = DayKey.date(from: selectedDay.day) else {
+            return "\(selectedDay.day) · \(TokenFormatter.short(selectedDay.tokens))"
+        }
+        let locale = Locale(identifier: "es")
+        let weekday = date.formatted(.dateTime.weekday(.abbreviated).locale(locale))
+        let dayAndMonth = date.formatted(.dateTime.day().month(.abbreviated).locale(locale))
+        return "\(weekday) \(dayAndMonth) · \(TokenFormatter.short(selectedDay.tokens))"
     }
 
     // MARK: - Barras
@@ -61,32 +81,53 @@ struct WeekSummaryView: View {
 
     private func dayBar(_ day: DayTotal) -> some View {
         let isToday = day.day == today
+        let isSelected = day.day == selectedDay
         let ratio = maxTokens > 0 ? Double(day.tokens) / Double(maxTokens) : 0
 
-        return VStack(spacing: 3) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(isToday ? Color.accentColor : Color.secondary.opacity(0.35))
-                .frame(height: max(2, 36 * ratio))
-                .frame(maxHeight: 36, alignment: .bottom)
+        return Button {
+            selectedDay = isSelected ? nil : day.day
+        } label: {
+            VStack(spacing: 3) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(barColor(isToday: isToday, isSelected: isSelected))
+                    .overlay {
+                        if isSelected {
+                            RoundedRectangle(cornerRadius: 2)
+                                .stroke(Color.primary, lineWidth: 1)
+                        }
+                    }
+                    .frame(height: max(2, 36 * ratio))
+                    .frame(maxHeight: 36, alignment: .bottom)
 
-            Text(weekdayLetter(day.day))
-                .font(.system(size: 8, weight: isToday ? .semibold : .regular))
-                .foregroundStyle(isToday ? .primary : .secondary)
+                Text(weekdayLetter(day.day))
+                    .font(.system(size: 8, weight: isToday || isSelected ? .semibold : .regular))
+                    .foregroundStyle(isToday || isSelected ? .primary : .secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
         }
-        .frame(maxWidth: .infinity)
+        .buttonStyle(.plain)
         .help("\(displayDate(day.day)): \(TokenFormatter.short(day.tokens)) tokens")
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(displayDate(day.day)), \(TokenFormatter.short(day.tokens)) tokens")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private func barColor(isToday: Bool, isSelected: Bool) -> Color {
+        if isToday { return Color.accentColor }
+        return Color.secondary.opacity(isSelected ? 0.7 : 0.35)
     }
 
     private func weekdayLetter(_ day: String) -> String {
         guard let date = DayKey.date(from: day) else { return "" }
-        return date.formatted(.dateTime.weekday(.narrow))
+        return date.formatted(.dateTime.weekday(.narrow).locale(Locale(identifier: "es")))
     }
 
     private func displayDate(_ day: String) -> String {
         guard let date = DayKey.date(from: day) else { return day }
-        return date.formatted(date: .abbreviated, time: .omitted)
+        return date.formatted(
+            .dateTime.day().month(.abbreviated).year().locale(Locale(identifier: "es"))
+        )
     }
 
     // MARK: - Racha
@@ -128,7 +169,20 @@ struct WeekSummaryView: View {
     }
 }
 
-#Preview {
+#Preview("Sin selección") {
+    WeekSummaryView(snapshot: previewSnapshot)
+        .frame(width: 276)
+        .padding(12)
+}
+
+#Preview("Día seleccionado") {
+    let days = DayKey.lastDays(7)
+    WeekSummaryView(snapshot: previewSnapshot, selectedDay: days[3])
+        .frame(width: 276)
+        .padding(12)
+}
+
+private let previewSnapshot: UsageSnapshot = {
     let days = DayKey.lastDays(7)
     let tokens = [12_000, 48_000, 0, 96_000, 74_000, 15_000, 120_000]
     var byApp: [AppSource: [DayTotal]] = [:]
@@ -136,7 +190,7 @@ struct WeekSummaryView: View {
         byApp[source] = zip(days, tokens).map { DayTotal(day: $0, tokens: source == .claudeCode ? $1 : 0) }
     }
 
-    let snapshot = UsageSnapshot(
+    return UsageSnapshot(
         todayByApp: [:],
         last7DaysByApp: byApp,
         todayTotalTokens: tokens.last ?? 0,
@@ -144,8 +198,4 @@ struct WeekSummaryView: View {
         currentStreak: 4,
         bestStreak: 9
     )
-
-    return WeekSummaryView(snapshot: snapshot)
-        .frame(width: 276)
-        .padding(12)
-}
+}()

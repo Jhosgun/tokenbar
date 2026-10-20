@@ -62,31 +62,6 @@ enum Keychain {
         return String(data: data, encoding: .utf8)
     }
 
-    /// Lee una entrada de OTRA app (service distinto al nuestro), como las credenciales
-    /// que Claude Code guarda bajo `Claude Code-credentials`.
-    ///
-    /// La primera vez macOS le pregunta al usuario si autoriza el acceso; si lo deniega,
-    /// esto devuelve `nil` y el proveedor reporta "no configurado". Nunca bloquea al usuario.
-    static func readForeign(service: String) -> String? {
-        var item: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        item[kSecReturnData as String] = true
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(item as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else {
-            if status != errSecItemNotFound {
-                log.debug("sin acceso a \(service, privacy: .public): \(status)")
-            }
-            return nil
-        }
-        return String(data: data, encoding: .utf8)
-    }
-
     private static func delete(forKey key: String) {
         let status = SecItemDelete(query(forKey: key) as CFDictionary)
         if status != errSecSuccess && status != errSecItemNotFound {

@@ -73,6 +73,8 @@ struct ClaudeCodeCollector: UsageCollector {
         let formatters = TimestampFormatters()
 
         var totals: [String: UsageRecord] = [:]
+        // Mismo delta que va a `totals`, atribuido además a su modelo (alimenta Estadísticas).
+        var models = ModelUsageAccumulator(source: source)
         var malformedLines = 0
         var filesScanned = 0
         var filesParsed = 0
@@ -143,6 +145,7 @@ struct ClaudeCodeCollector: UsageCollector {
                 switch await accumulate(
                     line: line.data,
                     into: &totals,
+                    models: &models,
                     todayKey: todayKey,
                     formatters: formatters
                 ) {
@@ -202,7 +205,8 @@ struct ClaudeCodeCollector: UsageCollector {
         let records = totals.values
             .filter { $0.totalTokens > 0 }
             .sorted { $0.day < $1.day }
-        return CollectorResult(records: records, status: .ok)
+        return CollectorResult(records: records, status: .ok,
+                               modelRecords: models.result().modelRecords)
     }
 
     private func shouldStop(clock: ContinuousClock, deadline: ContinuousClock.Instant) -> Bool {
@@ -360,6 +364,7 @@ struct ClaudeCodeCollector: UsageCollector {
     private func accumulate(
         line: Data,
         into totals: inout [String: UsageRecord],
+        models: inout ModelUsageAccumulator,
         todayKey: String,
         formatters: TimestampFormatters
     ) async -> LineOutcome {
@@ -413,6 +418,10 @@ struct ClaudeCodeCollector: UsageCollector {
             costUSD: cost
         )
         totals[day] = totals[day].map { $0 + delta } ?? delta
+        models.add(day: day, model: message.model ?? "desconocido",
+                   inputTokens: input, outputTokens: stateDelta.outputTokens,
+                   cacheCreationTokens: cacheCreation, cacheReadTokens: cacheRead,
+                   costUSD: cost)
         return .counted
     }
 

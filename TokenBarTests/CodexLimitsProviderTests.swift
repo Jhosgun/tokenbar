@@ -52,12 +52,17 @@ struct CodexLimitsProviderTests {
         let authURL: URL
         let sessionsURL: URL
         let session: URLSession
+        /// Reloj fijo para `fetch()`: se sitúa entre el `timestamp` del rollout (1790071200)
+        /// y sus resets (1790100000 / 1790600000), de modo que las ventanas siguen vigentes.
+        let now: Date
 
-        init(auth: String? = #"{"tokens":{"access_token":"token-falso","account_id":"cuenta-falsa"}}"#) throws {
+        init(auth: String? = #"{"tokens":{"access_token":"token-falso","account_id":"cuenta-falsa"}}"#,
+             now: Date = Date(timeIntervalSince1970: 1_790_080_000)) throws {
             root = FileManager.default.temporaryDirectory
                 .appending(path: "codex-limits-\(UUID().uuidString)", directoryHint: .isDirectory)
             authURL = root.appending(path: "auth.json")
             sessionsURL = root.appending(path: "sessions", directoryHint: .isDirectory)
+            self.now = now
             try FileManager.default.createDirectory(at: sessionsURL, withIntermediateDirectories: true)
             if let auth {
                 try Data(auth.utf8).write(to: authURL)
@@ -68,7 +73,8 @@ struct CodexLimitsProviderTests {
         }
 
         func provider() -> CodexLimitsProvider {
-            CodexLimitsProvider(authURL: authURL, sessionsURL: sessionsURL, session: session)
+            CodexLimitsProvider(authURL: authURL, sessionsURL: sessionsURL,
+                                session: session, now: { now })
         }
 
         func writeRollout(_ lines: [String], day: String = "2026/09/22",
@@ -118,6 +124,18 @@ struct CodexLimitsProviderTests {
     private static let rolloutLine = """
     {"timestamp":"2026-09-22T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"rate_limits":{"primary":{"used_percent":31.0,"window_minutes":300,"resets_at":1790100000},"secondary":{"used_percent":72.0,"window_minutes":10080,"resets_at":1790600000},"plan_type":"pro"}}}}
     """
+
+    /// JWT sintético con un `exp` controlable, para probar la detección local de expiración.
+    private static func jwt(exp: TimeInterval) -> String {
+        func segment(_ object: [String: Any]) -> String {
+            let data = try! JSONSerialization.data(withJSONObject: object)
+            return data.base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+        }
+        return "\(segment(["alg": "HS256"])).\(segment(["exp": exp])).firma"
+    }
 
     @Test("Codex se limita a la sección de cuotas")
     func clasificacionDeFuente() {
@@ -200,7 +218,7 @@ struct CodexLimitsProviderTests {
                 Date(timeIntervalSince1970: 1_790_683_200.123))
     }
 
-    @Test("un porcentaje fuera de 0…100 rechaza la ventana en vez de mostrar una cifra imposible")
+    @Test("un porcentaje superior a 100 conserva la ventana saturada")
     func porcentajeFueraDeRango() {
         let json = """
         {"plan_type":"pro",
@@ -208,7 +226,8 @@ struct CodexLimitsProviderTests {
                        "secondary_window":{"used_percent":20,"window_minutes":10080}}}
         """
         let snapshot = CodexLimitsProvider.parseUsage(Data(json.utf8))
-        #expect(snapshot?.windows.map(\.name) == ["Semanal"])
+        #expect(snapshot?.windows.map(\.name) == ["5 horas", "Semanal"])
+        #expect(snapshot?.windows.first?.utilization == 1)
     }
 
     @Test("un window_minutes que no cabe en un Int no revienta la conversión")
@@ -237,6 +256,14 @@ struct CodexLimitsProviderTests {
         let credential = try #require(CodexLimitsProvider.credential(at: harness.authURL))
         #expect(credential.accessToken == "token-falso")
         #expect(credential.accountID == "cuenta-falsa")
+    }
+
+    @Test("lee el claim exp del JWT y tolera tokens que no lo tienen")
+    func expiracionDelJWT() {
+        #expect(CodexLimitsProvider.expiration(from: Self.jwt(exp: 1_790_000_000))
+            == Date(timeIntervalSince1970: 1_790_000_000))
+        #expect(CodexLimitsProvider.expiration(from: "token-falso") == nil)
+        #expect(CodexLimitsProvider.expiration(from: "a.b.c") == nil)
     }
 
     @Test("auth ausente o incompleto queda no configurado sin red")
@@ -278,9 +305,12 @@ struct CodexLimitsProviderTests {
             #"{"payload":{"type":"mensaje","texto":"ignorar"}}"#,
             Self.rolloutLine
         ])
-        let snapshot = try #require(CodexLimitsProvider.latestRolloutSnapshot(in: harness.sessionsURL))
+        let snapshot = try #require(CodexLimitsProvider.latestRolloutSnapshot(
+            in: harness.sessionsURL, now: Date(timeIntervalSince1970: 1_790_080_000)))
         #expect(snapshot.planLabel == "pro")
         #expect(snapshot.windows.map(\.percent) == [31, 72])
+        // B2: el respaldo lleva la fecha del evento, no la de hoy.
+        #expect(snapshot.dataAsOf == Date(timeIntervalSince1970: 1_790_071_200))
     }
 
     @Test("encuentra el evento al final de una cola acotada")
@@ -290,7 +320,8 @@ struct CodexLimitsProviderTests {
         let prefix = String(repeating: #"{"payload":{"type":"otro"}}"# + "\n",
                             count: Int(CodexLimitsProvider.tailByteLimit / 20))
         _ = try harness.writeRollout([prefix, Self.rolloutLine])
-        let snapshot = try #require(CodexLimitsProvider.latestRolloutSnapshot(in: harness.sessionsURL))
+        let snapshot = try #require(CodexLimitsProvider.latestRolloutSnapshot(
+            in: harness.sessionsURL, now: Date(timeIntervalSince1970: 1_790_080_000)))
         #expect(snapshot.windows.first?.percent == 31)
     }
 
@@ -303,22 +334,59 @@ struct CodexLimitsProviderTests {
                          count: Int(CodexLimitsProvider.tailByteLimit) - data.count))
         #expect(data.count == Int(CodexLimitsProvider.tailByteLimit))
         _ = try harness.writeRollout(data)
-        let snapshot = try #require(CodexLimitsProvider.latestRolloutSnapshot(in: harness.sessionsURL))
+        let snapshot = try #require(CodexLimitsProvider.latestRolloutSnapshot(
+            in: harness.sessionsURL, now: Date(timeIntervalSince1970: 1_790_080_000)))
         #expect(snapshot.windows.first?.percent == 31)
     }
 
-    @Test("401 y 403 son credenciales inválidas, con o sin rollout local")
-    func unauthorized() async throws {
-        for code in [401, 403] {
-            let harness = try Harness()
-            defer { harness.cleanUp() }
-            _ = try harness.writeRollout([Self.rolloutLine])
-            StubURLProtocol.setHandler { _ in (code, Data()) }
-            let snapshot = await harness.provider().fetch()
-            // Es un estado definitivo: manda aunque el rollout local tenga ventanas.
-            #expect(snapshot.status == .invalidCredentials)
-            #expect(snapshot.windows.isEmpty)
+    @Test("un 401 no vacía la fila: muestra el rollout marcado como sesión vencida")
+    func unauthorized401ConservaRollout() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        _ = try harness.writeRollout([Self.rolloutLine])
+        StubURLProtocol.setHandler { _ in (401, Data()) }
+        let snapshot = await harness.provider().fetch()
+        #expect(snapshot.status == .failed("Sesión vencida: abre Codex"))
+        #expect(snapshot.windows.count == 2)
+    }
+
+    @Test("un 403 es transitorio y no vacía la fila")
+    func forbidden403ConservaRollout() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        _ = try harness.writeRollout([Self.rolloutLine])
+        StubURLProtocol.setHandler { _ in (403, Data()) }
+        let snapshot = await harness.provider().fetch()
+        #expect(snapshot.status == .failed("HTTP 403"))
+        #expect(snapshot.windows.count == 2)
+    }
+
+    @Test("un token vencido localmente no va a red y marca la sesión vencida")
+    func tokenVencidoLocalmente() async throws {
+        let jwt = Self.jwt(exp: 1_000_000)
+        let harness = try Harness(auth: """
+        {"tokens":{"access_token":"\(jwt)","account_id":"cuenta-falsa"}}
+        """, now: Date(timeIntervalSince1970: 2_000_000))
+        defer { harness.cleanUp() }
+        _ = try harness.writeRollout([Self.rolloutLine])
+        StubURLProtocol.setHandler { _ in
+            Issue.record("No debía hacer una petición con el token vencido")
+            return (500, Data())
         }
+        let snapshot = await harness.provider().fetch()
+        #expect(snapshot.status == .failed("Sesión vencida: abre Codex"))
+        #expect(snapshot.windows.count == 2)
+    }
+
+    @Test("descartar las ventanas cuyo reinicio ya pasó")
+    func descartaVentanasReseteadas() throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        _ = try harness.writeRollout([Self.rolloutLine])
+        // Después de ambos resets (1790100000 y 1790600000) no queda ninguna ventana.
+        let snapshot = CodexLimitsProvider.latestRolloutSnapshot(
+            in: harness.sessionsURL, now: Date(timeIntervalSince1970: 1_790_700_000))
+        #expect(snapshot == nil)
     }
 
     @Test("un 429 activa el backoff y conserva el rollout local si lo hay")

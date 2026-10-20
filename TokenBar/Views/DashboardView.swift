@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Popover principal de la barra de menú. Tamaño fijo 300×520.
+/// Popover principal de la barra de menú. Tamaño fijo 300×640.
 struct DashboardView: View {
 
     @Environment(\.openWindow) private var openWindow
@@ -48,6 +48,10 @@ struct DashboardView: View {
                     Divider()
 
                     WeekSummaryView(snapshot: viewModel.snapshot)
+
+                    Divider()
+
+                    StatsSectionView(viewModel: viewModel)
                 }
             }
 
@@ -56,7 +60,7 @@ struct DashboardView: View {
             footer
         }
         .padding(12)
-        .frame(width: 300, height: 520)
+        .frame(width: 300, height: 640)
         // El popover no puede crecer, así que se topa el escalado de texto y el contenido
         // se compacta (lineLimit + minimumScaleFactor) antes que desbordarse y recortarse.
         .dynamicTypeSize(...DynamicTypeSize.accessibility1)
@@ -81,7 +85,7 @@ struct DashboardView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Text(TokenFormatter.short(viewModel.snapshot.todayTotalTokens))
+            Text(TokenFormatter.short(viewModel.todayTotalTokens))
                 .font(.system(size: 34, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(.primary)
@@ -97,14 +101,14 @@ struct DashboardView: View {
     /// para que el primer arranque se lea como intencional y no como un error.
     @ViewBuilder
     private var headerSubtitle: some View {
-        if viewModel.snapshot.todayTotalTokens == 0 {
+        if viewModel.todayTotalTokens == 0 {
             Text("Sin consumo registrado hoy")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
         } else if viewModel.showCost {
-            Text(TokenFormatter.currency(viewModel.snapshot.todayCostUSD))
+            Text(TokenFormatter.currency(viewModel.todayCostUSD))
                 .font(.caption)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
@@ -170,7 +174,12 @@ struct DashboardView: View {
 
     private var lastUpdateText: String {
         guard let lastUpdate = viewModel.lastUpdate else { return "—" }
-        return "Actualizado \(lastUpdate.formatted(.dateTime.hour().minute()))"
+        let time = lastUpdate.formatted(
+            .dateTime.hour().minute().locale(Locale(identifier: "es"))
+        )
+        let updated = "Actualizado \(time)"
+        guard viewModel.lastErrorCount > 0 else { return updated }
+        return "\(updated) · \(viewModel.lastErrorCount) con errores"
     }
 
     /// El guion largo del estado inicial no se lee bien en VoiceOver.

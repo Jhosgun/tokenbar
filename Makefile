@@ -31,7 +31,7 @@ check-xcode:
 
 build: check-xcode
 	@xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Release \
-		-derivedDataPath $(DERIVED) build | tail -1
+		-derivedDataPath $(DERIVED) ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO build | tail -1
 	@echo "App: $(APP)"
 
 test: check-xcode

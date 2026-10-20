@@ -1,4 +1,6 @@
 import AppKit
+import OSLog
+import ServiceManagement
 import SwiftUI
 
 @main
@@ -11,10 +13,14 @@ struct TokenBarApp: App {
         let state = CollectorStateStore()
         let viewModel = UsageViewModel(
             store: UsageStore(),
+            modelStore: ModelUsageStore(),
             state: state,
             collectors: [
                 ClaudeCodeCollector(store: state),
-                CursorCollector(store: state)
+                CursorCollector(store: state),
+                CodexCollector(store: state),
+                CommandCodeCollector(store: state),
+                OpenCodeCollector(store: state)
             ],
             // Los límites vienen de la cuenta, no de los transcripts: son fuentes
             // independientes y por eso van por su propio carril.
@@ -30,7 +36,30 @@ struct TokenBarApp: App {
         _viewModel = State(initialValue: viewModel)
         // Arranca aquí, no en un `.task` de la vista: el popover puede no abrirse nunca
         // y el ícono igual tiene que reaccionar.
-        viewModel.start()
+        if !Self.isTestHost {
+            Self.registerAtLoginIfNeeded()
+            viewModel.start()
+        }
+    }
+
+    private static func registerAtLoginIfNeeded() {
+        let service = SMAppService.mainApp
+        guard LaunchAtLogin.shouldRegister(
+            status: service.status,
+            decided: LaunchAtLogin.hasUserDecision
+        ) else { return }
+
+        do {
+            try service.register()
+        } catch {
+            Logger(subsystem: "io.github.jhosgun.tokenbar", category: "launch-at-login")
+                .error("no se pudo registrar el inicio de sesión: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Existe cuando Xcode inyecta el bundle de tests: como host, arrancar leería el llavero real y haría red.
+    private static var isTestHost: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
 
     var body: some Scene {

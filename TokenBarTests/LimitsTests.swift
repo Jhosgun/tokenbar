@@ -44,18 +44,30 @@ struct LimitWindowTests {
         #expect(LimitWindow(name: "x", utilization: 0).timeRemaining(from: now) == nil)
     }
 
-    @Test("worst devuelve la ventana más comprometida")
+    @Test("worst devuelve la ventana activa más comprometida")
     func peorVentana() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
         let snapshot = LimitsSnapshot(
             source: .claudeCode,
             windows: [
                 LimitWindow(name: "5 horas", utilization: 0.21),
-                LimitWindow(name: "Semanal", utilization: 0.87),
+                LimitWindow(name: "Semanal vencida", utilization: 0.99,
+                            resetsAt: now.addingTimeInterval(-1)),
                 LimitWindow(name: "Opus", utilization: 0.40)
             ],
             planLabel: nil, status: .ok)
-        #expect(snapshot.worst?.name == "Semanal")
-        #expect(LimitsSnapshot.empty(.cursor, .notConfigured).worst == nil)
+        #expect(snapshot.worst(at: now)?.name == "Opus")
+        #expect(snapshot.primary(at: now)?.name == "5 horas")
+        #expect(LimitsSnapshot.empty(.cursor, .notConfigured).worst(at: now) == nil)
+    }
+
+    @Test("un porcentaje superior a 100 se satura y los inválidos se rechazan")
+    func porcentajeNormalizado() {
+        #expect(LimitWindow.utilization(fromPercent: 140) == 1)
+        #expect(LimitWindow.utilization(fromPercent: 100) == 1)
+        #expect(LimitWindow.utilization(fromPercent: -1) == nil)
+        #expect(LimitWindow.utilization(fromPercent: .infinity) == nil)
+        #expect(LimitWindow.utilization(fromPercent: .nan) == nil)
     }
 }
 
@@ -107,16 +119,16 @@ struct ClaudeLimitsProviderTests {
         #expect(snapshot.planLabel == "créditos 250/10000")
     }
 
-    @Test("un porcentaje fuera de 0…100 se rechaza en vez de mostrar una cifra imposible")
+    @Test("un porcentaje negativo se rechaza y uno superior a 100 se satura")
     func porcentajeFueraDeRango() {
-        // -5% o 250% no pueden ser un consumo real: la ventana se omite en vez de
-        // acotarse a un valor inventado.
         let negativo = #"{"five_hour":{"utilization":-5.0},"seven_day":{"utilization":40.0}}"#
         let snapshotNegativo = ClaudeLimitsProvider.parse(Data(negativo.utf8))
         #expect(snapshotNegativo?.windows.map(\.name) == ["Semanal"])
 
         let excesivo = #"{"five_hour":{"utilization":250.0}}"#
-        #expect(ClaudeLimitsProvider.parse(Data(excesivo.utf8)) == nil)
+        let snapshotExcesivo = ClaudeLimitsProvider.parse(Data(excesivo.utf8))
+        #expect(snapshotExcesivo?.windows.map(\.name) == ["5 horas"])
+        #expect(snapshotExcesivo?.windows.first?.utilization == 1)
     }
 
     @Test("un crédito extra que no cabe en un Int no revienta la conversión")
@@ -148,8 +160,11 @@ struct ClaudeLimitsProviderTests {
         let plano = #"{"access_token":"tok-123"}"#
         #expect(ClaudeLimitsProvider.accessToken(from: plano) == "tok-123")
 
-        // Si no es JSON se asume que ya viene el token pelado.
-        #expect(ClaudeLimitsProvider.accessToken(from: "  tok-pelado  ") == "tok-pelado")
+        let conVencimiento = #"{"claudeAiOauth":{"accessToken":"tok-vigente","expiresAt":2000000000000}}"#
+        let credential = ClaudeLimitsProvider.credential(from: conVencimiento)
+        #expect(credential?.accessToken == "tok-vigente")
+        #expect(credential?.expiresAt == Date(timeIntervalSince1970: 2_000_000_000))
+        #expect(ClaudeLimitsProvider.accessToken(from: "tok-pelado") == nil)
 
         #expect(ClaudeLimitsProvider.accessToken(from: nil) == nil)
         #expect(ClaudeLimitsProvider.accessToken(from: "") == nil)
@@ -320,8 +335,8 @@ struct ClaudeLocalCacheTests {
         #expect(abs(cached.snapshot.windows[3].utilization - 0.40) < 0.0001)
     }
 
-    @Test("fetchedAtMs con más de 30 min marca el dato desactualizado, no lo oculta")
-    func marcaDesactualizado() throws {
+    @Test("fetchedAtMs conserva la fecha y edad reales del dato local")
+    func conservaFechaDelDato() throws {
         let now = Date(timeIntervalSince1970: 1_790_544_000)
         let utilization = #"{"five_hour":{"utilization":21.0},"seven_day":{"utilization":71}}"#
 
@@ -335,19 +350,21 @@ struct ClaudeLocalCacheTests {
                                              utilization: utilization))
         defer { try? FileManager.default.removeItem(at: viejo47) }
         let cached47 = try #require(ClaudeLimitsProvider.cachedUsage(at: viejo47, now: now))
-        #expect(cached47.snapshot.status == .failed("hace 47m"))
+        #expect(cached47.snapshot.status == .ok)
         #expect(cached47.snapshot.windows.count == 2)
         #expect(abs(cached47.age - 47 * 60) < 1)
+        #expect(cached47.snapshot.dataAsOf == now.addingTimeInterval(-47 * 60))
 
         let viejo2h = try write(Self.fixture(fetchedAtMs: Self.ms(now.addingTimeInterval(-(2 * 3600 + 5 * 60))),
                                              utilization: utilization))
         defer { try? FileManager.default.removeItem(at: viejo2h) }
         let cached2h = try #require(ClaudeLimitsProvider.cachedUsage(at: viejo2h, now: now))
-        #expect(cached2h.snapshot.status == .failed("hace 2h 5m"))
+        #expect(cached2h.snapshot.status == .ok)
+        #expect(abs(cached2h.age - (2 * 3600 + 5 * 60)) < 1)
     }
 
-    @Test("archivo ausente, corrupto o sin la clave devuelve nil, y fetch reporta error sin crashear")
-    func archivoProblematico() async throws {
+    @Test("archivo ausente, corrupto o sin la clave devuelve nil")
+    func archivoProblematico() throws {
         let now = Date(timeIntervalSince1970: 1_790_544_000)
         let inexistente = FileManager.default.temporaryDirectory
             .appending(path: "no-existe-\(UUID().uuidString).json")
@@ -360,127 +377,6 @@ struct ClaudeLocalCacheTests {
         let sinClave = try write(#"{"otraCosa":1}"#)
         defer { try? FileManager.default.removeItem(at: sinClave) }
         #expect(ClaudeLimitsProvider.cachedUsage(at: sinClave, now: now) == nil)
-
-        // Sin caché usable ni token, fetch reporta un estado de error y no toca la red.
-        let session = NeverProtocol.makeSession()
-        let provider = ClaudeLimitsProvider(cacheURL: corrupto,
-                                            session: session,
-                                            tokenCache: KeychainTokenCache(read: { nil }),
-                                            userAgent: "claude-code/test")
-        let snapshot = await provider.fetch()
-        #expect(snapshot.status == .notConfigured)
-        #expect(snapshot.windows.isEmpty)
-        #expect(NeverProtocol.calls.value == 0)
-    }
-
-    @Test("con caché fresca fetch no toca la red ni el llavero")
-    func cacheFrescaNoTocaRed() async throws {
-        let utilization = #"{"five_hour":{"utilization":21.0},"seven_day":{"utilization":71}}"#
-        let url = try write(Self.fixture(fetchedAtMs: Self.ms(Date()), utilization: utilization))
-        defer { try? FileManager.default.removeItem(at: url) }
-
-        let keychainReads = LockedCounter()
-        let session = NeverProtocol.makeSession()
-        let provider = ClaudeLimitsProvider(
-            cacheURL: url,
-            session: session,
-            tokenCache: KeychainTokenCache(read: { keychainReads.increment(); return "tok" }),
-            userAgent: "claude-code/test")
-        let snapshot = await provider.fetch()
-        #expect(snapshot.status == .ok)
-        #expect(snapshot.windows.count == 2)
-        #expect(keychainReads.value == 0)
-        #expect(NeverProtocol.calls.value == 0)
-    }
-
-    @Test("caché entre 30 min y 2 h se muestra marcada sin ir a la red")
-    func cacheMarcadaSinRed() async throws {
-        let utilization = #"{"five_hour":{"utilization":21.0},"seven_day":{"utilization":71}}"#
-        let vieja47 = try write(Self.fixture(fetchedAtMs: Self.ms(Date().addingTimeInterval(-47 * 60)),
-                                             utilization: utilization))
-        defer { try? FileManager.default.removeItem(at: vieja47) }
-
-        let session = NeverProtocol.makeSession()
-        let provider = ClaudeLimitsProvider(cacheURL: vieja47,
-                                            session: session,
-                                            tokenCache: KeychainTokenCache(read: { nil }),
-                                            userAgent: "claude-code/test")
-        let snapshot = await provider.fetch()
-        #expect(snapshot.status == .failed("hace 47m"))
-        #expect(snapshot.windows.count == 2)
-        #expect(NeverProtocol.calls.value == 0)
-    }
-
-    /// URLProtocol que responde siempre con un código fijo, para simular un 401/403 de red.
-    private final class FixedStatusProtocol: URLProtocol {
-        nonisolated(unsafe) static var statusCode = 401
-        override class func canInit(with request: URLRequest) -> Bool { true }
-        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-        override func startLoading() {
-            let response = HTTPURLResponse(url: request.url!, statusCode: Self.statusCode,
-                                           httpVersion: nil, headerFields: nil)!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data())
-            client?.urlProtocolDidFinishLoading(self)
-        }
-        override func stopLoading() {}
-
-        static func makeSession() -> URLSession {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.protocolClasses = [FixedStatusProtocol.self]
-            return URLSession(configuration: configuration)
-        }
-    }
-
-    @Test("un token rechazado por la red manda sobre la caché vieja, aunque tenga ventanas")
-    func credencialInvalidaMandaSobreCache() async throws {
-        let utilization = #"{"five_hour":{"utilization":21.0},"seven_day":{"utilization":71}}"#
-        let vieja3h = try write(Self.fixture(fetchedAtMs: Self.ms(Date().addingTimeInterval(-3 * 3600)),
-                                             utilization: utilization))
-        defer { try? FileManager.default.removeItem(at: vieja3h) }
-
-        FixedStatusProtocol.statusCode = 401
-        let provider = ClaudeLimitsProvider(
-            cacheURL: vieja3h,
-            session: FixedStatusProtocol.makeSession(),
-            tokenCache: KeychainTokenCache(read: { "tok" }),
-            userAgent: "claude-code/test")
-        let snapshot = await provider.fetch()
-        // Antes de este arreglo, esto devolvía la caché de 3 h marcada "hace 3h" en vez de
-        // avisar que hay que volver a iniciar sesión.
-        #expect(snapshot.status == .invalidCredentials)
-        #expect(snapshot.windows.isEmpty)
-    }
-
-    @Test("caché de más de 2 h intenta la red; sin token se muestra la caché marcada")
-    func cacheViejaSinToken() async throws {
-        let utilization = #"{"five_hour":{"utilization":21.0},"seven_day":{"utilization":71}}"#
-        let vieja3h = try write(Self.fixture(fetchedAtMs: Self.ms(Date().addingTimeInterval(-3 * 3600)),
-                                             utilization: utilization))
-        defer { try? FileManager.default.removeItem(at: vieja3h) }
-
-        let keychainReads = LockedCounter()
-        let session = NeverProtocol.makeSession()
-        let provider = ClaudeLimitsProvider(
-            cacheURL: vieja3h,
-            session: session,
-            tokenCache: KeychainTokenCache(read: { keychainReads.increment(); return nil }),
-            userAgent: "claude-code/test")
-        let snapshot = await provider.fetch()
-        // Sin token no hay consulta posible; la caché vieja se muestra con su marca.
-        #expect(snapshot.status == .failed("hace 3h"))
-        #expect(snapshot.windows.count == 2)
-        #expect(keychainReads.value == 1)
-        #expect(NeverProtocol.calls.value == 0)
-    }
-
-    @Test("la válvula deja pasar la red solo una vez cada 15 min")
-    func valvulaDeRed() async {
-        let throttle = ClaudeLimitsProvider.NetworkThrottle(interval: 15 * 60)
-        let t0 = Date(timeIntervalSince1970: 1_000_000)
-        #expect(await throttle.tryAttempt(now: t0))
-        #expect(await !throttle.tryAttempt(now: t0.addingTimeInterval(14 * 60)))
-        #expect(await throttle.tryAttempt(now: t0.addingTimeInterval(15 * 60)))
     }
 
     @Test("el User-Agent es el del CLI de Claude Code")
@@ -547,14 +443,14 @@ struct CursorLimitsProviderTests {
         let databaseURL: URL
         let session: URLSession
 
-        init(withCredential: Bool = true) throws {
+        init(withCredential: Bool = true, exp: TimeInterval = 9_999_999_999) throws {
             root = FileManager.default.temporaryDirectory
                 .appending(path: "cursor-limits-\(UUID().uuidString)", directoryHint: .isDirectory)
             databaseURL = root.appending(path: "state.vscdb")
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             if withCredential {
                 try Self.writeDatabase(at: databaseURL, token: CursorLimitsProviderTests.jwt(
-                    sub: "google-oauth2|user_prueba", exp: 9_999_999_999))
+                    sub: "google-oauth2|user_prueba", exp: exp))
             }
             let configuration = URLSessionConfiguration.ephemeral
             configuration.protocolClasses = [StubURLProtocol.self]
@@ -651,6 +547,195 @@ struct CursorLimitsProviderTests {
         #expect(summary.extraWindows.isEmpty)
     }
 
+    @Test("sin totalPercentUsed el tope es breakdown.total, contando el bono")
+    func bonoCuentaComoTope() throws {
+        // Sin breakdown.total, used + remaining = 60/60 = 100 %. Con el bono, el tope real
+        // es 100 y la utilización baja a 60 %.
+        let json = """
+        {"billingCycleEnd":"2026-10-07T02:26:43Z","membershipType":"pro",
+         "individualUsage":{"plan":{"used":60,"remaining":0,
+           "breakdown":{"included":60,"bonus":40,"total":100}}}}
+        """
+        let summary = try #require(CursorLimitsProvider.parseSummary(Data(json.utf8)))
+        #expect(abs(try #require(summary.utilization) - 0.6) < 0.0001)
+    }
+
+    @Test("un plan ilimitado es válido y no lleva barras")
+    func planIlimitado() throws {
+        let json = """
+        {"billingCycleEnd":"2026-10-07T02:26:43Z","membershipType":"ultra",
+         "isUnlimited":true,"individualUsage":{"plan":{}}}
+        """
+        let summary = try #require(CursorLimitsProvider.parseSummary(Data(json.utf8)))
+        #expect(summary.isUnlimited)
+        #expect(summary.utilization == nil)
+    }
+
+    @Test("en un plan de equipo el consumo se lee de teamUsage")
+    func planDeEquipo() throws {
+        let json = """
+        {"billingCycleEnd":"2026-10-07T02:26:43Z","membershipType":"team",
+         "limitType":"team",
+         "teamUsage":{"plan":{"totalPercentUsed":50}},
+         "individualUsage":{"plan":{"totalPercentUsed":10}}}
+        """
+        let summary = try #require(CursorLimitsProvider.parseSummary(Data(json.utf8)))
+        #expect(summary.utilization == 0.5)
+    }
+
+    @Test("sin base o sin llave es no configurado; un error de lectura es .failed")
+    func lecturaDeLaBase() async throws {
+        // Base ausente → notConfigured (sin red).
+        let sinBase = try Harness(withCredential: false)
+        defer { sinBase.cleanUp() }
+        StubURLProtocol.setHandler { _ in
+            Issue.record("No debía hacer una petición")
+            return (500, Data())
+        }
+        #expect(await sinBase.provider().fetch().status == .notConfigured)
+
+        // Archivo corrupto → .failed, distinto de "no configurado".
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "cursor-corrupto-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = root.appending(path: "state.vscdb")
+        try Data("no es una base".utf8).write(to: db)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        StubURLProtocol.setHandler { _ in
+            Issue.record("No debía hacer una petición")
+            return (500, Data())
+        }
+        let provider = CursorLimitsProvider(databaseURL: db, session: session)
+        let snapshot = await provider.fetch()
+        // 26 = SQLITE_NOTADB: el mensaje lleva el código para que el log diga la causa.
+        #expect(snapshot.status == .failed("No se pudo leer la sesión de Cursor (SQLite 26)"))
+        #expect(snapshot.windows.isEmpty)
+    }
+
+    /// Conexión de escritura que mantiene la base bloqueada (`BEGIN EXCLUSIVE`) hasta
+    /// `release()`. Simula a Cursor escribiendo, o a la otra conexión de este proceso
+    /// rehaciendo el índice del WAL, sin tocar la base real.
+    private final class ExclusiveLock: @unchecked Sendable {
+        private var database: OpaquePointer?
+
+        init(at url: URL) throws {
+            guard sqlite3_open(url.path, &database) == SQLITE_OK,
+                  sqlite3_exec(database, "BEGIN EXCLUSIVE", nil, nil, nil) == SQLITE_OK else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+
+        func release() {
+            guard let database else { return }
+            sqlite3_exec(database, "COMMIT", nil, nil, nil)
+            sqlite3_close(database)
+            self.database = nil
+        }
+    }
+
+    @Test("una base bloqueada por una escritura corta se lee igual gracias al busy timeout")
+    func busyTimeoutEsperaLaEscritura() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        let lock = try ExclusiveLock(at: harness.databaseURL)
+        // Se suelta a los 300 ms: después del reintento (200 ms) y antes del busy timeout
+        // (500 ms), así solo el busy timeout puede resolverlo. Va por GCD, no por el pool
+        // cooperativo, porque la espera dentro de SQLite es síncrona.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { lock.release() }
+        let result = await CursorSession.accessTokenResult(from: harness.databaseURL)
+        if case .failure(let error) = result {
+            Issue.record("debía leerse tras soltar el bloqueo: \(error)")
+        }
+        lock.release()
+    }
+
+    @Test("un bloqueo sostenido falla con el código SQLite en el mensaje, no como no configurado")
+    func bloqueoSostenidoLlevaElCodigo() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        StubURLProtocol.setHandler { _ in
+            Issue.record("No debía hacer una petición")
+            return (500, Data())
+        }
+        let lock = try ExclusiveLock(at: harness.databaseURL)
+        defer { lock.release() }
+        let snapshot = await harness.provider().fetch()
+        // 5 = SQLITE_BUSY: se agotaron el busy timeout y el reintento.
+        #expect(snapshot.status == .failed("No se pudo leer la sesión de Cursor (SQLite 5)"))
+    }
+
+    @Test("reintenta una vez tras 200 ms: un archivo ilegible que se arregla a tiempo se lee")
+    func reintentaUnaVez() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        let target = harness.root.appending(path: "retry.vscdb")
+        try Data("no es una base".utf8).write(to: target)
+        let valid = harness.databaseURL
+        // El arreglo va por GCD a los 50 ms, bien antes del reintento (200 ms).
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+            try? FileManager.default.removeItem(at: target)
+            try? FileManager.default.moveItem(at: valid, to: target)
+        }
+        let result = await CursorSession.accessTokenResult(from: target)
+        if case .failure(let error) = result {
+            Issue.record("debía leerse en el reintento: \(error)")
+        }
+    }
+
+    @Test("un fallo de lectura usa la credencial del ciclo anterior; sin base vuelve a no configurado")
+    func credencialRecordada() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        StubURLProtocol.setHandler { _ in (200, Data(Self.summary.utf8)) }
+        let provider = harness.provider()
+
+        #expect(await provider.fetch().status == .ok)
+
+        // La base se vuelve ilegible: la fila no se cae, se consulta con la credencial de antes.
+        try Data("no es una base".utf8).write(to: harness.databaseURL)
+        let recordada = await provider.fetch()
+        #expect(recordada.status == .ok)
+        #expect(recordada.windows.count == 1)
+
+        // Sin base (sesión cerrada) no se tapa nada: no configurado, y se olvida la credencial.
+        try FileManager.default.removeItem(at: harness.databaseURL)
+        #expect(await provider.fetch().status == .notConfigured)
+        try Data("no es una base".utf8).write(to: harness.databaseURL)
+        #expect(await provider.fetch().status == .failed("No se pudo leer la sesión de Cursor (SQLite 26)"))
+    }
+
+    @Test("sin credencial previa, o con una ya vencida, el fallo de lectura se reporta")
+    func credencialRecordadaVencida() async throws {
+        let harness = try Harness(exp: 2_000_000_000)
+        defer { harness.cleanUp() }
+        let cache = CursorSession.CredentialCache()
+
+        let fresca = await cache.credentialResult(from: harness.databaseURL,
+                                                  now: Date(timeIntervalSince1970: 1_000_000_000))
+        #expect((try? fresca.get())?.isExpired == false)
+
+        try Data("no es una base".utf8).write(to: harness.databaseURL)
+        let vencida = await cache.credentialResult(from: harness.databaseURL,
+                                                  now: Date(timeIntervalSince1970: 3_000_000_000))
+        guard case .failure(let error) = vencida else {
+            Issue.record("una credencial recordada ya vencida no debía usarse")
+            return
+        }
+        #expect(error == .readFailed(code: 26))
+
+        let sinPrevia = await CursorSession.CredentialCache()
+            .credentialResult(from: harness.databaseURL, now: Date(timeIntervalSince1970: 1_000_000_000))
+        guard case .failure(let primerError) = sinPrevia else {
+            Issue.record("sin credencial previa el fallo debía reportarse")
+            return
+        }
+        #expect(primerError == .readFailed(code: 26))
+    }
+
     @Test("muestra bajo demanda solo cuando tiene un tope explícito")
     func bajoDemanda() throws {
         let json = """
@@ -721,14 +806,22 @@ struct CursorLimitsProviderTests {
         #expect(snapshot.windows.isEmpty)
     }
 
-    @Test("401 y 403 reportan credenciales inválidas")
+    @Test("401 es credencial inválida y 403 es transitorio")
     func unauthorized() async throws {
-        for code in [401, 403] {
+        do {
             let harness = try Harness()
             defer { harness.cleanUp() }
-            StubURLProtocol.setHandler { _ in (code, Data()) }
+            StubURLProtocol.setHandler { _ in (401, Data()) }
             let snapshot = await harness.provider().fetch()
             #expect(snapshot.status == .invalidCredentials)
+            #expect(snapshot.windows.isEmpty)
+        }
+        do {
+            let harness = try Harness()
+            defer { harness.cleanUp() }
+            StubURLProtocol.setHandler { _ in (403, Data()) }
+            let snapshot = await harness.provider().fetch()
+            #expect(snapshot.status == .failed("HTTP 403"))
             #expect(snapshot.windows.isEmpty)
         }
     }
@@ -779,58 +872,50 @@ struct CursorLimitsProviderTests {
     }
 }
 
-@Suite("KeychainTokenCache")
-struct KeychainTokenCacheTests {
-
-    /// Contador de lecturas seguro para concurrencia.
-    private actor Counter {
-        private(set) var value = 0
-        func increment() { value += 1 }
+@Suite("ClaudeCredentialReader")
+struct ClaudeCredentialReaderTests {
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = 0
+        var value: Int { lock.lock(); defer { lock.unlock() }; return storage }
+        func increment() { lock.lock(); defer { lock.unlock() }; storage += 1 }
     }
 
-    @Test("el llavero se consulta una sola vez aunque se pida el token muchas veces")
-    func leeUnaSolaVez() async {
-        let counter = Counter()
-        let cache = KeychainTokenCache(read: {
-            Task { await counter.increment() }
-            return "tok"
-        })
-        // Simula 10 ciclos de refresco.
-        for _ in 0..<10 {
-            #expect(await cache.token() == "tok")
-        }
-        // Da tiempo a que los Task del contador terminen.
-        try? await Task.sleep(for: .milliseconds(50))
-        #expect(await counter.value == 1)
+    @Test("clasifica la salida de security sin exponer la credencial")
+    func clasificaSalida() {
+        #expect(ClaudeCredentialReader.classify(SecurityCommandOutput(
+            stdout: "credencial-sintetica\n", stderr: "", exitCode: 0, timedOut: false))
+            == .credential("credencial-sintetica"))
+        #expect(ClaudeCredentialReader.classify(SecurityCommandOutput(
+            stdout: "", stderr: "", exitCode: 44, timedOut: false)) == .notFound)
+        #expect(ClaudeCredentialReader.classify(SecurityCommandOutput(
+            stdout: "", stderr: "", exitCode: 51, timedOut: false)) == .locked)
+        #expect(ClaudeCredentialReader.classify(SecurityCommandOutput(
+            stdout: "", stderr: "User canceled the operation.", exitCode: 128, timedOut: false))
+            == .denied)
+        #expect(ClaudeCredentialReader.classify(SecurityCommandOutput(
+            stdout: "", stderr: "", exitCode: nil, timedOut: true)) == .timedOut)
     }
 
-    @Test("un 'no hay token' también se recuerda: no se reintenta en cada ciclo")
-    func recuerdaLaAusencia() async {
-        let counter = Counter()
-        let cache = KeychainTokenCache(read: {
-            Task { await counter.increment() }
-            return nil
+    @Test("solo una denegación explícita queda cacheada")
+    func cacheaSoloDenegacion() async {
+        let deniedCalls = LockedCounter()
+        let denied = ClaudeCredentialReader(run: {
+            deniedCalls.increment()
+            return SecurityCommandOutput(stdout: "", stderr: "authorization denied",
+                                         exitCode: 128, timedOut: false)
         })
-        for _ in 0..<5 {
-            #expect(await cache.token() == nil)
-        }
-        try? await Task.sleep(for: .milliseconds(50))
-        // Si esto fuera > 1, el usuario vería un diálogo de llavero cada 30 segundos.
-        #expect(await counter.value == 1)
-    }
+        #expect(await denied.read() == .denied)
+        #expect(await denied.read() == .denied)
+        #expect(deniedCalls.value == 1)
 
-    @Test("invalidate fuerza una relectura, para cuando el token se rotó")
-    func invalidateRelee() async {
-        let counter = Counter()
-        let cache = KeychainTokenCache(read: {
-            Task { await counter.increment() }
-            return "tok"
+        let transientCalls = LockedCounter()
+        let transient = ClaudeCredentialReader(run: {
+            transientCalls.increment()
+            return SecurityCommandOutput(stdout: "", stderr: "", exitCode: nil, timedOut: true)
         })
-        _ = await cache.token()
-        _ = await cache.token()
-        await cache.invalidate()
-        _ = await cache.token()
-        try? await Task.sleep(for: .milliseconds(50))
-        #expect(await counter.value == 2)
+        #expect(await transient.read() == .timedOut)
+        #expect(await transient.read() == .timedOut)
+        #expect(transientCalls.value == 2)
     }
 }

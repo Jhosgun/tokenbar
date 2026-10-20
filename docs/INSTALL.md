@@ -2,7 +2,17 @@
 
 Requisitos: **macOS 14 (Sonoma) o superior**. Solo hace falta Xcode si la vas a compilar tú.
 
-## 1. Homebrew (recomendado)
+## 1. Instalar directamente con curl (recomendado)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Jhosgun/tokenbar/main/install.sh | sh
+```
+
+El script descarga la última release, verifica su `sha256`, instala en `/Applications`
+(o `~/Applications` si no tienes permisos), quita la cuarentena y abre TokenBar. Para fijar
+una versión: `TOKENBAR_VERSION=1.2.3 sh -c "$(curl -fsSL https://raw.githubusercontent.com/Jhosgun/tokenbar/main/install.sh)"`.
+
+## 2. Homebrew
 
 ```sh
 brew trust jhosgun/tap          # Homebrew exige confiar en los taps de terceros
@@ -11,16 +21,6 @@ brew install --cask jhosgun/tap/tokenbar
 
 Para actualizar: `brew upgrade --cask tokenbar`. Para quitarla con todos sus datos:
 `brew uninstall --zap --cask tokenbar`.
-
-## 2. Descargar el zip
-
-Baja `TokenBar-<versión>.zip` de la [última release][releases], descomprímelo y arrastra
-`TokenBar.app` a `/Applications`. En la página de cada release está el `sha256` del
-archivo, por si lo quieres verificar:
-
-```sh
-shasum -a 256 ~/Downloads/TokenBar-<versión>.zip
-```
 
 ## 3. Compilar desde el código
 
@@ -54,6 +54,8 @@ solo con software cuyo origen conozcas. Si prefieres no hacerlo, usa la opción 
 compílala tú: el código es el mismo que produce el binario de las releases.
 
 ## Primer arranque
+
+Desde la primera ejecución, TokenBar se abre sola al iniciar sesión; puedes desactivarlo en Preferencias.
 
 1. Aparece un ícono en la barra de menú. La app no sale en el Dock.
 2. Clic en el ícono para ver una fila por herramienta, y clic en una fila para desplegar

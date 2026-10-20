@@ -131,17 +131,23 @@ struct OpenCodeGoLimitsProviderTests {
         #expect(snapshot.windows.map { $0.resetsAt?.timeIntervalSince1970 } == [60, 120, 180])
     }
 
-    @Test("prioriza opencode-go y usa opencode como fallback")
-    func prioridadDeCredencial() throws {
+    @Test("solo usa la clave opencode-go; con solo opencode queda no configurado")
+    func prioridadDeCredencial() async throws {
         let both = try Harness(auth: """
         {"opencode-go":{"type":"api","key":"go"},"opencode":{"type":"api","key":"base"}}
         """)
         defer { both.cleanUp() }
         #expect(OpenCodeGoLimitsProvider.apiKey(at: both.authURL) == "go")
 
+        // B15: con solo la clave de Zen (`opencode`) no hay cuota de Go que leer.
         let fallback = try Harness(auth: #"{"opencode":{"type":"api","key":"base"}}"#)
         defer { fallback.cleanUp() }
-        #expect(OpenCodeGoLimitsProvider.apiKey(at: fallback.authURL) == "base")
+        #expect(OpenCodeGoLimitsProvider.apiKey(at: fallback.authURL) == nil)
+        StubURLProtocol.setHandler { _ in
+            Issue.record("No debía hacer una petición")
+            return (500, Data())
+        }
+        #expect(await fallback.provider().fetch().status == .notConfigured)
     }
 
     @Test("credencial ausente o inválida queda no configurada sin red")
@@ -173,14 +179,22 @@ struct OpenCodeGoLimitsProviderTests {
         #expect(await harness.provider().fetch().status == .ok)
     }
 
-    @Test("401 y 403 reportan credenciales inválidas")
+    @Test("401 es credencial inválida y 403 es transitorio")
     func unauthorized() async throws {
-        for code in [401, 403] {
+        do {
             let harness = try Harness()
             defer { harness.cleanUp() }
-            StubURLProtocol.setHandler { _ in (code, Data()) }
+            StubURLProtocol.setHandler { _ in (401, Data()) }
             let snapshot = await harness.provider().fetch()
             #expect(snapshot.status == .invalidCredentials)
+            #expect(snapshot.windows.isEmpty)
+        }
+        do {
+            let harness = try Harness()
+            defer { harness.cleanUp() }
+            StubURLProtocol.setHandler { _ in (403, Data()) }
+            let snapshot = await harness.provider().fetch()
+            #expect(snapshot.status == .failed("HTTP 403"))
             #expect(snapshot.windows.isEmpty)
         }
     }
@@ -199,12 +213,16 @@ struct OpenCodeGoLimitsProviderTests {
     @Test("formatos desconocidos y cifras inválidas fallan suavemente")
     func formatoDesconocido() async throws {
         for body in ["sin objeto", "{ rolling: { usagePercent: 10 } }",
-                     #"{"rolling":{"usagePercent":-1,"resetInSec":60}}"#,
-                     // Un porcentaje por encima de 100 es un dato imposible: se rechaza en
-                     // vez de acotarlo a un usado inventado.
-                     #"{"rolling":{"usagePercent":130,"resetInSec":60}}"#] {
+                     #"{"rolling":{"usagePercent":-1,"resetInSec":60}}"#] {
             #expect(OpenCodeGoLimitsProvider.parse(Data(body.utf8), now: Date()) == nil)
         }
+
+        // Un porcentaje por encima de 100 es sobreconsumo real: se satura a 1 en vez
+        // de desaparecer justo al pasarse de la cuota (B9).
+        let excesivo = OpenCodeGoLimitsProvider.parse(
+            Data(#"{"rolling":{"usagePercent":130,"resetInSec":60}}"#.utf8), now: Date())
+        #expect(excesivo?.windows.count == 1)
+        #expect(excesivo?.windows.first?.utilization == 1)
 
         let harness = try Harness()
         defer { harness.cleanUp() }

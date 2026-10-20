@@ -9,7 +9,12 @@ cask "tokenbar" do
   desc "Menu bar app that shows token usage and remaining quota of your AI coding tools"
   homepage "https://github.com/Jhosgun/tokenbar"
 
-  depends_on macos: :sonoma
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on macos: ">= :sonoma"
 
   app "TokenBar.app"
 

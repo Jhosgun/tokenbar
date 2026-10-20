@@ -45,12 +45,16 @@ struct LimitWindow: Identifiable, Hashable, Sendable {
     }
 
     /// Convierte un porcentaje en la escala 0…100 (la que informan casi todos los
-    /// proveedores) a una fracción 0…1. Fuera de ese rango el dato es imposible —nadie
-    /// puede llevar consumido un 130%, ni un -5%— así que se rechaza en vez de acotarlo:
-    /// acotarlo mostraría una cifra inventada en vez de fallar suave.
+    /// proveedores) a una fracción 0…1. Un valor por encima del tope describe
+    /// sobreconsumo real, así que se satura a 1; negativos y no finitos se rechazan.
     static func utilization(fromPercent percent: Double) -> Double? {
-        guard percent.isFinite, percent >= 0, percent <= 100 else { return nil }
-        return percent / 100
+        guard percent.isFinite, percent >= 0 else { return nil }
+        return min(percent / 100, 1)
+    }
+
+    func hasReset(at now: Date = Date()) -> Bool {
+        guard let resetsAt else { return false }
+        return resetsAt < now
     }
 
     /// Convierte un cociente usado/tope en una fracción 0…1. A diferencia del porcentaje,
@@ -114,8 +118,11 @@ struct LimitsSnapshot: Equatable, Sendable {
     }
 
     /// La ventana más comprometida, que es la que manda en el color del ícono.
-    var worst: LimitWindow? {
-        windows.max { $0.utilization < $1.utilization }
+    var worst: LimitWindow? { worst(at: Date()) }
+
+    func worst(at now: Date) -> LimitWindow? {
+        windows.filter { !$0.hasReset(at: now) }
+            .max { $0.utilization < $1.utilization }
     }
 
     /// La ventana que representa a la fuente cuando la fila está plegada: **la primera**.
@@ -123,12 +130,19 @@ struct LimitsSnapshot: Equatable, Sendable {
     /// que semanal)— porque es la que decide si puedes seguir trabajando ahora mismo. No
     /// se usa `worst`: una cuota por modelo al 100% taparía la de 5 h, que es la que
     /// importa de un vistazo.
-    var primary: LimitWindow? { windows.first }
+    var primary: LimitWindow? { primary(at: Date()) }
+
+    func primary(at now: Date) -> LimitWindow? {
+        windows.first { !$0.hasReset(at: now) }
+    }
 
     /// La ventana crítica o en aviso que **no** es la principal, si la hay: la fila
     /// plegada la señala con un punto para que un tope por modelo no pase desapercibido.
-    var hiddenAlert: LimitWindow? {
-        guard let worst, worst.severity != .normal, worst.id != primary?.id else { return nil }
+    var hiddenAlert: LimitWindow? { hiddenAlert(at: Date()) }
+
+    func hiddenAlert(at now: Date) -> LimitWindow? {
+        guard let worst = worst(at: now), worst.severity != .normal,
+              worst.id != primary(at: now)?.id else { return nil }
         return worst
     }
 }

@@ -244,18 +244,101 @@ struct CommandCodeLimitsProviderTests {
         #expect(CommandCodeLimitsProvider.organization(from: Data(#"{}"#.utf8)) == nil)
     }
 
-    @Test("401 y 403 reportan credenciales inválidas")
+    @Test("un 401 reporta credenciales inválidas y un 403 es transitorio")
     func unauthorized() async throws {
-        for code in [401, 403] {
+        // 401 es definitivo: vacía la fila.
+        do {
             let harness = try Harness()
             defer { harness.cleanUp() }
             StubURLProtocol.setHandler { request in
                 if request.url?.path == "/alpha/whoami" { return (200, Data(Self.whoami.utf8)) }
-                return (code, Data())
+                return (401, Data())
             }
             let snapshot = await harness.provider().fetch()
             #expect(snapshot.status == .invalidCredentials)
             #expect(snapshot.windows.isEmpty)
+        }
+        // 403 es transitorio (B13): no es credencial rota.
+        do {
+            let harness = try Harness()
+            defer { harness.cleanUp() }
+            StubURLProtocol.setHandler { request in
+                if request.url?.path == "/alpha/whoami" { return (200, Data(Self.whoami.utf8)) }
+                return (403, Data())
+            }
+            let snapshot = await harness.provider().fetch()
+            #expect(snapshot.status == .failed("HTTP 403"))
+            #expect(snapshot.windows.isEmpty)
+        }
+    }
+
+    @Test("un timeout de red se reporta como 'Tiempo de espera agotado', no 'Sin conexión'")
+    func timeout() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        StubURLProtocol.setHandler { request in
+            if request.url?.path == "/alpha/whoami" { throw URLError(.timedOut) }
+            return (500, Data())
+        }
+        let snapshot = await harness.provider().fetch()
+        #expect(snapshot.status == .failed("Tiempo de espera agotado"))
+    }
+
+    @Test("resetAt <= 0 se trata como 'sin fecha' y no como 1970")
+    func resetAtCero() throws {
+        let credits = """
+        {"credits":{"planId":"pro","monthlyCredits":760},
+         "windowLimits":{"limited":true,
+           "fiveHour":{"used":25,"cap":100,"resetAt":0},
+           "weekly":{"used":60,"cap":200,"resetAt":0}}}
+        """
+        let snapshot = try #require(CommandCodeLimitsProvider.parse(
+            creditsData: Data(credits.utf8),
+            subscriptionsData: Data(Self.subscriptions.utf8),
+            summaryData: Data(Self.summary.utf8)))
+        #expect(snapshot.windows.first { $0.name == "5 horas" }?.resetsAt == nil)
+        #expect(snapshot.windows.first { $0.name == "Semanal" }?.resetsAt == nil)
+    }
+
+    @Test("sin suscripción ni resumen se pierden solo 'Mes' y la etiqueta")
+    func suscripcionOpcional() throws {
+        let credits = """
+        {"credits":{"planId":"pro","monthlyCredits":760},
+         "windowLimits":{"limited":true,
+           "fiveHour":{"used":25,"cap":100,"resetAt":1790089200000},
+           "weekly":{"used":60,"cap":200,"resetAt":1790683200}}}
+        """
+        let snapshot = try #require(CommandCodeLimitsProvider.parse(
+            creditsData: Data(credits.utf8),
+            subscriptionsData: nil,
+            summaryData: nil))
+        #expect(snapshot.windows.map(\.name) == ["5 horas", "Semanal"])
+        #expect(snapshot.planLabel == nil)
+    }
+
+    @Test("un fallo de red o HTTP en suscripción o resumen conserva 5 horas y semanal")
+    func auxiliaresFallan() async throws {
+        for failing in ["/alpha/billing/subscriptions", "/alpha/usage/summary"] {
+            for status in [500, 0] {
+                let harness = try Harness()
+                defer { harness.cleanUp() }
+                StubURLProtocol.setHandler { request in
+                    let path = try #require(request.url).path
+                    if path == failing {
+                        if status == 0 { throw URLError(.notConnectedToInternet) }
+                        return (status, Data())
+                    }
+                    switch path {
+                    case "/alpha/whoami": return (200, Data(Self.whoami.utf8))
+                    case "/alpha/billing/credits": return (200, Data(Self.credits.utf8))
+                    case "/alpha/billing/subscriptions": return (200, Data(Self.subscriptions.utf8))
+                    default: return (200, Data(Self.summary.utf8))
+                    }
+                }
+                let snapshot = await harness.provider().fetch()
+                #expect(snapshot.status == .ok)
+                #expect(snapshot.windows.map(\.name) == ["5 horas", "Semanal"])
+            }
         }
     }
 

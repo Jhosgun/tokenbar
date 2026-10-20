@@ -3,20 +3,23 @@ import SwiftUI
 
 /// Logo de una herramienta.
 ///
-/// Cuando su app de escritorio está instalada se usa **su propio ícono**, pedido al sistema
-/// por bundle id: así el logo es el real y TokenBar no empaqueta imágenes de terceros. Las
-/// herramientas que solo tienen CLI (Command Code, OpenCode, el `agy` de Antigravity) no
-/// tienen app que consultar y caen en su SF Symbol de siempre.
+/// El orden de búsqueda es: primero el ícono de su app de escritorio, pedido al sistema por
+/// bundle id; si no está instalada, el logo empaquetado en el catálogo de assets
+/// (`LogoOpenCode`, `LogoAntigravity`, `LogoCommandCode`), que es cuadrado y se redondea al
+/// dibujarlo; y como último recurso su SF Symbol.
 struct SourceIconView: View {
     let source: AppSource
     var size: CGFloat = 16
 
     var body: some View {
         if let icon = SourceIcon.icon(for: source) {
-            Image(nsImage: icon)
+            Image(nsImage: icon.image)
                 .resizable()
                 .interpolation(.high)
                 .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(
+                    cornerRadius: SourceIcon.cornerRadius(for: icon, size: size),
+                    style: .continuous))
         } else {
             Image(systemName: source.symbolName)
                 .font(.system(size: size * 0.8))
@@ -30,12 +33,23 @@ struct SourceIconView: View {
 /// vista se redibuja en cada ciclo de refresco.
 @MainActor
 enum SourceIcon {
-    private static var cache: [AppSource: NSImage] = [:]
-    /// Las fuentes que ya se buscaron y no tienen app. Van en un set aparte para no repetir
+    /// Ícono resuelto y si es un logo empaquetado (cuadrado, sin el margen que ya traen los
+    /// íconos de app del sistema), en cuyo caso hay que redondearlo al dibujarlo.
+    struct Resolved {
+        let image: NSImage
+        let isBundled: Bool
+    }
+
+    /// Radio de la esquina de los logos empaquetados, proporcional al tamaño dibujado, para
+    /// que se vean como los íconos de app que tienen al lado.
+    private static let bundledCornerRatio: CGFloat = 0.22
+
+    private static var cache: [AppSource: Resolved] = [:]
+    /// Las fuentes que ya se buscaron y no tienen logo. Van en un set aparte para no repetir
     /// la búsqueda en cada redibujo: son la mayoría (las herramientas de solo CLI).
     private static var missing: Set<AppSource> = []
 
-    static func icon(for source: AppSource) -> NSImage? {
+    static func icon(for source: AppSource) -> Resolved? {
         if let cached = cache[source] { return cached }
         if missing.contains(source) { return nil }
         guard let icon = load(source) else {
@@ -46,11 +60,28 @@ enum SourceIcon {
         return icon
     }
 
-    private static func load(_ source: AppSource) -> NSImage? {
-        guard let identifier = source.bundleIdentifier,
-              let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)
-        else { return nil }
-        return NSWorkspace.shared.icon(forFile: url.path)
+    /// Nombre del logo empaquetado en el catálogo para las herramientas que solo tienen CLI.
+    private static func bundledLogoName(for source: AppSource) -> String? {
+        switch source {
+        case .antigravity: return "LogoAntigravity"
+        case .commandCode: return "LogoCommandCode"
+        case .opencode: return "LogoOpenCode"
+        case .claudeCode, .cursor, .codex: return nil
+        }
+    }
+
+    static func cornerRadius(for icon: Resolved, size: CGFloat) -> CGFloat {
+        icon.isBundled ? size * bundledCornerRatio : 0
+    }
+
+    private static func load(_ source: AppSource) -> Resolved? {
+        if let identifier = source.bundleIdentifier,
+           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
+            return Resolved(image: NSWorkspace.shared.icon(forFile: url.path), isBundled: false)
+        }
+        guard let name = bundledLogoName(for: source),
+              let image = NSImage(named: name) else { return nil }
+        return Resolved(image: image, isBundled: true)
     }
 }
 

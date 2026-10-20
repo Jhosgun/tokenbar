@@ -28,18 +28,26 @@ struct CodexLimitsProvider: LimitsProvider {
     private let authURL: URL
     private let sessionsURL: URL
     private let session: URLSession
+    private let now: @Sendable () -> Date
 
     init(authURL: URL = CodexLimitsProvider.defaultAuthURL,
          sessionsURL: URL = CodexLimitsProvider.defaultSessionsURL,
-         session: URLSession = .shared) {
+         session: URLSession = .shared,
+         now: @escaping @Sendable () -> Date = Date.init) {
         self.authURL = authURL
         self.sessionsURL = sessionsURL
         self.session = session
+        self.now = now
     }
 
     func fetch() async -> LimitsSnapshot {
         guard let credential = Self.credential(at: authURL) else {
             return .empty(source, .notConfigured)
+        }
+        // B1: si el JWT ya venció, no vale la pena ir a red: solo el CLI renueva el token
+        // y TokenBar no debe hacerlo. Se muestra el último rollout marcado en vez de vaciar.
+        if let expiresAt = credential.expiresAt, expiresAt <= now() {
+            return expiredFallback()
         }
         return await NetworkDeadline.run(budget: Self.fetchBudget) {
             await self.requestUsage(credential: credential)
@@ -60,10 +68,13 @@ struct CodexLimitsProvider: LimitsProvider {
                 case 200..<300:
                     if let snapshot = Self.parseUsage(data) { return snapshot }
                     return fallback(or: .failed("Respuesta no reconocida"))
-                case 401, 403:
-                    // Estado definitivo: hay que reautenticar, así que no tiene sentido
-                    // taparlo con el rollout local.
-                    return .empty(source, .invalidCredentials)
+                case 401:
+                    // B1: el token venció (o el CLI lo rotó). No se vacía la fila: se
+                    // muestra el último rollout marcado. Renovar el token es cosa del CLI.
+                    return expiredFallback()
+                case 403:
+                    // B13: un 403 es transitorio (p. ej. Cloudflare), no una credencial rota.
+                    return keepingRollout(status: .failed("HTTP 403"))
                 case 429:
                     return rateLimited(retryAfter: RetryAfter.date(from: http))
                 default:
@@ -81,7 +92,7 @@ struct CodexLimitsProvider: LimitsProvider {
     /// Un 429 activa el backoff del ViewModel (`rateLimited`), pero conserva las ventanas
     /// del rollout local si las hay: el endpoint saturado no tiene por qué vaciar la fila.
     private func rateLimited(retryAfter: Date?) -> LimitsSnapshot {
-        guard var snapshot = Self.latestRolloutSnapshot(in: sessionsURL) else {
+        guard var snapshot = Self.latestRolloutSnapshot(in: sessionsURL, now: now()) else {
             return .rateLimited(source, retryAfter: retryAfter)
         }
         snapshot.status = .failed("Límite de consultas alcanzado")
@@ -91,10 +102,27 @@ struct CodexLimitsProvider: LimitsProvider {
     }
 
     private func fallback(or status: CollectorStatus) -> LimitsSnapshot {
-        guard var snapshot = Self.latestRolloutSnapshot(in: sessionsURL) else {
+        guard var snapshot = Self.latestRolloutSnapshot(in: sessionsURL, now: now()) else {
             return .empty(source, status)
         }
         snapshot.status = .failed("A la última actividad")
+        return snapshot
+    }
+
+    /// B1: sesión vencida. La fila no se vacía: se muestra el último rollout con su
+    /// antigüedad real, y el estado avisa que hay que reabrir Codex para renovar.
+    private func expiredFallback() -> LimitsSnapshot {
+        keepingRollout(status: .failed("Sesión vencida: abre Codex"))
+    }
+
+    /// Como `fallback(or:)`, pero conserva el mensaje exacto del estado en vez de
+    /// reemplazarlo por "A la última actividad": lo usan los estados que tienen un
+    /// mensaje propio que importa (sesión vencida, 403).
+    private func keepingRollout(status: CollectorStatus) -> LimitsSnapshot {
+        guard var snapshot = Self.latestRolloutSnapshot(in: sessionsURL, now: now()) else {
+            return .empty(source, status)
+        }
+        snapshot.status = status
         return snapshot
     }
 
@@ -103,6 +131,8 @@ struct CodexLimitsProvider: LimitsProvider {
     struct Credential: Equatable, Sendable {
         let accessToken: String
         let accountID: String
+        /// Vencimiento del JWT según su claim `exp`; `nil` si no se pudo leer.
+        let expiresAt: Date?
     }
 
     private struct AuthFile: Decodable {
@@ -125,7 +155,23 @@ struct CodexLimitsProvider: LimitsProvider {
               let accessToken = auth.tokens?.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines),
               let accountID = auth.tokens?.accountID?.trimmingCharacters(in: .whitespacesAndNewlines),
               !accessToken.isEmpty, !accountID.isEmpty else { return nil }
-        return Credential(accessToken: accessToken, accountID: accountID)
+        return Credential(accessToken: accessToken,
+                          accountID: accountID,
+                          expiresAt: expiration(from: accessToken))
+    }
+
+    /// Lee el claim `exp` del JWT de acceso, para detectar la sesión vencida sin red.
+    static func expiration(from token: String) -> Date? {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return nil }
+        var base64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        guard let data = Data(base64Encoded: base64),
+              let claims = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = (claims["exp"] as? NSNumber)?.doubleValue, exp.isFinite else { return nil }
+        return Date(timeIntervalSince1970: exp)
     }
 
     // MARK: - Parsing
@@ -246,7 +292,7 @@ struct CodexLimitsProvider: LimitsProvider {
 
     // MARK: - Rollouts locales
 
-    static func latestRolloutSnapshot(in sessionsURL: URL) -> LimitsSnapshot? {
+    static func latestRolloutSnapshot(in sessionsURL: URL, now: Date = Date()) -> LimitsSnapshot? {
         for file in recentRolloutFiles(in: sessionsURL) {
             guard let tail = tail(of: file) else { continue }
             var data = tail.data
@@ -258,21 +304,30 @@ struct CodexLimitsProvider: LimitsProvider {
             for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
                 guard let data = line.data(using: .utf8),
                       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let snapshot = rolloutSnapshot(from: root) else { continue }
+                      let snapshot = rolloutSnapshot(from: root, now: now) else { continue }
                 return snapshot
             }
         }
         return nil
     }
 
-    private static func rolloutSnapshot(from root: [String: Any]) -> LimitsSnapshot? {
+    private static func rolloutSnapshot(from root: [String: Any], now: Date) -> LimitsSnapshot? {
         let payload = (root["payload"] as? [String: Any]) ?? root
         guard payload["type"] as? String == "token_count" else { return nil }
         let rateLimits = payload["rate_limits"] as? [String: Any]
             ?? (payload["info"] as? [String: Any])?["rate_limits"] as? [String: Any]
         guard let rateLimits else { return nil }
         let plan = rateLimits["plan_type"] as? String ?? payload["plan_type"] as? String
-        return snapshot(rateLimit: rateLimits, plan: plan)
+        guard var snapshot = snapshot(rateLimit: rateLimits, plan: plan) else { return nil }
+        // B2: el respaldo lleva la fecha real del evento, no la de la consulta de hoy.
+        snapshot.dataAsOf = resetDate(from: root["timestamp"])
+        // B2: una ventana cuyo reinicio ya pasó describe un estado que dejó de ser cierto
+        // (habría que mostrarla en 0 %). Se descarta en vez de pintar "20 %, reinicia ahora".
+        snapshot.windows = snapshot.windows.filter { window in
+            guard let resetsAt = window.resetsAt else { return true }
+            return resetsAt > now
+        }
+        return snapshot.windows.isEmpty ? nil : snapshot
     }
 
     private static func recentRolloutFiles(in root: URL) -> [URL] {

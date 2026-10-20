@@ -6,6 +6,14 @@ cuota. Nativa y sin dependencias externas.
 
 ## Instalar
 
+La forma directa, sin compilar ni instalar dependencias:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Jhosgun/tokenbar/main/install.sh | sh
+```
+
+Con Homebrew:
+
 ```sh
 brew trust jhosgun/tap
 brew install --cask jhosgun/tap/tokenbar
@@ -13,8 +21,11 @@ brew install --cask jhosgun/tap/tokenbar
 
 O compílala tú: `git clone https://github.com/Jhosgun/tokenbar.git && cd tokenbar && make install`.
 
-La app **no está notarizada** por Apple, así que macOS avisa la primera vez; las tres vías
-de instalación y qué hacer con ese aviso están en [`docs/INSTALL.md`](docs/INSTALL.md).
+Desde la primera ejecución, TokenBar se abre sola al iniciar sesión; puedes desactivarlo en Preferencias.
+
+La app **no está notarizada** por Apple. El instalador directo quita la cuarentena; con
+Homebrew o el zip, macOS puede avisar la primera vez. Las tres vías y qué hacer con ese
+aviso están en [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## Requisitos
 
@@ -59,13 +70,18 @@ El proyecto usa **synchronized root groups**: cualquier archivo `.swift` que dej
 | `TokenBar/Models/` | Tipos compartidos: `AppSource`, `UsageRecord` + `DayKey`, `Pricing`, `TokenFormatter`. |
 | `TokenBar/Collectors/` | El protocolo `UsageCollector` (+ `CollectorStatus`/`CollectorResult`) y los collectors con fuente de tokens. Cada uno devuelve solo deltas nuevos y nunca lanza. |
 | `TokenBar/Storage/` | Dos actores: `UsageStore` (acumula por día y persiste `usage.json`) y `CollectorStateStore` (offsets, dedup y bootstrap en `state.json`). |
-| `TokenBar/Views/` | `DashboardView` (300×380), `AppRowView`, `SparklineView` (Swift Charts) y `PreferencesView`. |
+| `TokenBar/Views/` | `DashboardView` (popover 300×640) con la sección Estadísticas, sus gráficas y tabla compacta; además de las filas de herramientas, `SparklineView` y `PreferencesView`. |
 | `TokenBar/Support/` | Utilidades transversales sin lógica de negocio, como el acceso al Keychain. |
 | `TokenBar/Resources/` | `Assets.xcassets`. |
 | `TokenBarTests/` | Tests unitarios (Swift Testing) de modelos, acumulación por día y parsing. |
 
-`CONTRACT.md` es la fuente de verdad de los tipos compartidos; `plan.md` y `tasks.md`
-describen el alcance y el orden de ejecución.
+Las gráficas de **Estadísticas** viven dentro del mismo popover, debajo del resumen semanal:
+permiten elegir 7, 30 o 90 días, agrupar por herramienta o modelo y alternar entre acumulado
+y consumo diario sin abrir una ventana aparte.
+
+`CONTRACT.md` es la fuente de verdad de los tipos compartidos. La arquitectura completa,
+con diagramas del ciclo de refresco, las fuentes por herramienta, el modelo de datos y la
+distribución, está en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md).
 
 ## Fuentes de datos
 
@@ -75,10 +91,13 @@ describen el alcance y el orden de ejecución.
   para no re-procesar todo el historial. Los duplicados aparentes son parciales de streaming del mismo mensaje, con el output
   creciendo línea a línea; el collector lleva una marca de agua para no perderlo ni contarlo dos veces.
 - **Cursor** — no hay tokens en archivos locales; se consulta la API de uso de cursor.com con
-  un token de sesión que pegas una vez en Preferencias y se guarda en el Keychain. Sin token,
-  la fila muestra "No configurado" y no rompe nada.
-- **Antigravity** — no tiene una fuente fiable de conteo de tokens; su cuota la obtiene
-  `AntigravityLimitsProvider` mediante la CLI.
+  la sesión que Cursor guarda en su `state.vscdb` (se lee en solo lectura, no hay que pegar
+  nada). Cursor actualiza cada evento mientras el turno sigue: el collector guarda una foto
+  por evento y suma solo el crecimiento.
+- **Codex, Command Code y OpenCode** — leen sus sesiones locales (JSONL o SQLite) y
+  deduplican por id de respuesta/mensaje.
+- **Antigravity** — sin collector de tokens; su cuota se consulta en el endpoint de Google
+  con el token que el CLI `agy` guarda en el llavero (respaldo: `agy -p /usage`).
 
 ## Privacidad
 

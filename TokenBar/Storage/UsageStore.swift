@@ -11,7 +11,7 @@ struct DayTotal: Codable, Hashable, Sendable, Identifiable {
 
 /// Vista inmutable del consumo, lista para pintar la UI.
 struct UsageSnapshot: Sendable, Equatable {
-    /// Consumo de hoy por app. Siempre trae las 3 claves de `AppSource.allCases`.
+    /// Consumo de hoy por app. Siempre trae las claves de `AppSource.tokenSources`.
     var todayByApp: [AppSource: UsageRecord]
     /// Serie de 7 días por app, del más viejo al más nuevo, con ceros incluidos.
     var last7DaysByApp: [AppSource: [DayTotal]]
@@ -50,7 +50,7 @@ struct UsageSnapshot: Sendable, Equatable {
         let days = DayKey.lastDays(7)
         var byApp: [AppSource: UsageRecord] = [:]
         var series: [AppSource: [DayTotal]] = [:]
-        for source in AppSource.allCases {
+        for source in AppSource.tokenSources {
             byApp[source] = UsageRecord(source: source, day: today)
             series[source] = days.map { DayTotal(day: $0, tokens: 0) }
         }
@@ -219,7 +219,7 @@ actor UsageStore {
         var totalTokens = 0
         var totalCost: Double = 0
 
-        for source in AppSource.allCases {
+        for source in AppSource.tokenSources {
             let record = records[Key(source: source, day: today)]
                 ?? UsageRecord(source: source, day: today)
             todayByApp[source] = record
@@ -237,6 +237,15 @@ actor UsageStore {
                              todayCostUSD: totalCost,
                              currentStreak: Streak.current(activeDays: activeDays(), today: today),
                              bestStreak: bestStreak)
+    }
+
+    /// Registros por (app, día) con `day >= firstDay`, ordenados por día y app: la fuente de
+    /// las series de Estadísticas. Solo incluye días con consumo; el relleno de ceros es de
+    /// quien los grafica.
+    func records(fromDay firstDay: String) async -> [UsageRecord] {
+        records.values
+            .filter { $0.day >= firstDay }
+            .sorted { ($0.day, $0.source.rawValue) < ($1.day, $1.source.rawValue) }
     }
 
     /// Borra el detalle por herramienta con más de `days` de antigüedad y, si se da

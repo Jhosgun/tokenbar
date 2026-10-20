@@ -112,7 +112,7 @@ struct UsageStoreTests {
         let snapshot = await store.snapshot()
         #expect(snapshot.todayByApp[.claudeCode]?.inputTokens == 10)
         #expect(snapshot.todayByApp[.cursor]?.inputTokens == 20)
-        #expect(snapshot.todayByApp[.antigravity]?.inputTokens == 0)
+        #expect(snapshot.todayByApp[.antigravity] == nil)
         #expect(snapshot.todayTotalTokens == 30)
 
         // La serie va de viejo (índice 0) a nuevo (índice 6 = hoy).
@@ -163,7 +163,7 @@ struct UsageStoreTests {
         #expect(payload.records.count == 2)
     }
 
-    @Test("snapshot siempre trae las 3 apps y 7 días con ceros rellenados")
+    @Test("snapshot siempre trae las fuentes de tokens y 7 días con ceros rellenados")
     func snapshotSiempreCompleto() async throws {
         let directory = makeTemporaryDirectory()
         defer { removeDirectory(directory) }
@@ -176,10 +176,10 @@ struct UsageStoreTests {
         let today = DayKey.today()
         let expectedDays = DayKey.lastDays(7)
 
-        #expect(snapshot.todayByApp.count == AppSource.allCases.count)
-        #expect(snapshot.last7DaysByApp.count == AppSource.allCases.count)
+        #expect(snapshot.todayByApp.count == AppSource.tokenSources.count)
+        #expect(snapshot.last7DaysByApp.count == AppSource.tokenSources.count)
 
-        for source in AppSource.allCases {
+        for source in AppSource.tokenSources {
             let record = try #require(snapshot.todayByApp[source])
             #expect(record.source == source)
             #expect(record.day == today)
@@ -190,19 +190,20 @@ struct UsageStoreTests {
         }
 
         // La app sin datos queda en ceros, no ausente.
-        let antigravity = try #require(snapshot.last7DaysByApp[.antigravity])
-        #expect(snapshot.todayByApp[.antigravity]?.totalTokens == 0)
-        #expect(antigravity.allSatisfy({ $0.tokens == 0 }))
+        let codex = try #require(snapshot.last7DaysByApp[.codex])
+        #expect(snapshot.todayByApp[.codex]?.totalTokens == 0)
+        #expect(codex.allSatisfy({ $0.tokens == 0 }))
+        #expect(snapshot.todayByApp[.antigravity] == nil)
     }
 
-    @Test("UsageSnapshot.empty trae las 3 apps y 7 días en cero")
+    @Test("UsageSnapshot.empty trae las fuentes de tokens y 7 días en cero")
     func snapshotVacio() throws {
         let snapshot = UsageSnapshot.empty
         #expect(snapshot.todayTotalTokens == 0)
         #expect(approxEqual(snapshot.todayCostUSD, 0))
-        #expect(snapshot.todayByApp.count == AppSource.allCases.count)
+        #expect(snapshot.todayByApp.count == AppSource.tokenSources.count)
 
-        for source in AppSource.allCases {
+        for source in AppSource.tokenSources {
             let series = try #require(snapshot.last7DaysByApp[source])
             #expect(series.count == 7)
             #expect(series.allSatisfy({ $0.tokens == 0 }))

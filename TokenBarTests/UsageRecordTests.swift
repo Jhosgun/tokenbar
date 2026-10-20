@@ -94,6 +94,46 @@ struct UsageRecordTests {
     }
 }
 
+@Suite("ModelUsageRecord")
+struct ModelUsageRecordTests {
+
+    @Test("suma los componentes y conserva la clave por modelo")
+    func sumaComponenteAComponente() {
+        let lhs = ModelUsageRecord(source: .codex, day: "2026-10-05", model: "gpt-5.6",
+                                   inputTokens: 10, outputTokens: 2,
+                                   cacheCreationTokens: 3, cacheReadTokens: 4, costUSD: 0.1)
+        let rhs = ModelUsageRecord(source: .codex, day: "2026-10-05", model: "gpt-5.6",
+                                   inputTokens: 1, outputTokens: 5,
+                                   cacheCreationTokens: 6, cacheReadTokens: 7, costUSD: 0.2)
+        let sum = lhs + rhs
+
+        #expect(sum.source == .codex)
+        #expect(sum.day == "2026-10-05")
+        #expect(sum.model == "gpt-5.6")
+        #expect(sum.inputTokens == 11)
+        #expect(sum.outputTokens == 7)
+        #expect(sum.cacheCreationTokens == 9)
+        #expect(sum.cacheReadTokens == 11)
+        #expect(sum.totalTokens == 38)
+        #expect(approxEqual(sum.costUSD, 0.3))
+    }
+
+    @Test("sobrevive un round-trip de JSON")
+    func codableRoundTrip() throws {
+        let record = ModelUsageRecord(source: .opencode, day: "2026-10-05", model: "kimi-k3",
+                                      inputTokens: 1, outputTokens: 2,
+                                      cacheCreationTokens: 3, cacheReadTokens: 4, costUSD: 0.01)
+        let data = try JSONEncoder().encode(record)
+        #expect(try JSONDecoder().decode(ModelUsageRecord.self, from: data) == record)
+    }
+
+    @Test("CollectorResult conserva las llamadas existentes sin desglose")
+    func collectorResultPorDefecto() {
+        let result = CollectorResult(records: [], status: .ok)
+        #expect(result.modelRecords.isEmpty)
+    }
+}
+
 // MARK: - DayKey
 
 @Suite("DayKey")
@@ -381,13 +421,13 @@ struct AppSourceTests {
         #expect(AppSource.opencode.bundleIdentifier == nil)
     }
 
-    @Test("solo Claude Code y Cursor tienen fuente de tokens; el resto es solo cuota")
+    @Test("tokenSources contiene toda herramienta con fuente de tokens")
     func fuentesDeTokens() {
-        #expect(AppSource.claudeCode.hasTokenSource)
-        #expect(AppSource.cursor.hasTokenSource)
-        for source in [AppSource.antigravity, .codex, .commandCode, .opencode] {
-            #expect(!source.hasTokenSource, "\(source.displayName) no tiene tokens que contar")
+        #expect(AppSource.tokenSources == [.claudeCode, .cursor, .codex, .commandCode, .opencode])
+        for source in AppSource.tokenSources {
+            #expect(source.hasTokenSource, "\(source.displayName) tiene tokens que contar")
         }
+        #expect(!AppSource.antigravity.hasTokenSource)
     }
 
     @Test("toda fuente sin logo real tiene un SF Symbol de respaldo y un nombre visible")

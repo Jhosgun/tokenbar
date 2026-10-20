@@ -56,7 +56,8 @@ struct OpenCodeGoLimitsProvider: LimitsProvider {
             if let http = response as? HTTPURLResponse {
                 switch http.statusCode {
                 case 200..<300: break
-                case 401, 403: return .empty(source, .invalidCredentials)
+                case 401: return .empty(source, .invalidCredentials)
+                case 403: return .empty(source, .failed("HTTP 403"))   // B13: transitorio
                 case 429: return .rateLimited(source, retryAfter: RetryAfter.date(from: http))
                 default: return .empty(source, .failed("HTTP \(http.statusCode)"))
                 }
@@ -76,14 +77,13 @@ struct OpenCodeGoLimitsProvider: LimitsProvider {
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        for name in ["opencode-go", "opencode"] {
-            guard let entry = root[name] as? [String: Any],
-                  entry["type"] as? String == "api",
-                  let key = (entry["key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !key.isEmpty else { continue }
-            return key
-        }
-        return nil
+        // B15: esta fila es de OpenCode Go. Si solo existe la clave de Zen (`opencode`),
+        // aquí no hay nada que mostrar: se reporta "no configurado", no "token inválido".
+        guard let entry = root["opencode-go"] as? [String: Any],
+              entry["type"] as? String == "api",
+              let key = (entry["key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !key.isEmpty else { return nil }
+        return key
     }
 
     static func parse(_ data: Data, now: Date) -> LimitsSnapshot? {

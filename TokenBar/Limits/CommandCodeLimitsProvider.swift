@@ -14,6 +14,10 @@ struct CommandCodeLimitsProvider: LimitsProvider {
 
     private static let log = Logger(subsystem: "io.github.jhosgun.tokenbar", category: "command-code-limits")
 
+    /// Plazo absoluto para las cuatro peticiones (B6).
+    /// 10 s: las cuatro tardan ~3,2 s en un día normal y 5 s se agotaba en los lentos.
+    static let fetchBudget: Duration = .seconds(10)
+
     private let authURL: URL
     private let session: URLSession
     private let baseURL: URL
@@ -30,42 +34,47 @@ struct CommandCodeLimitsProvider: LimitsProvider {
         guard let apiKey = Self.apiKey(at: authURL) else {
             return .empty(source, .notConfigured)
         }
+        return await NetworkDeadline.run(budget: Self.fetchBudget) {
+            await self.fetchUsage(apiKey: apiKey)
+        } ?? .empty(source, .failed("Tiempo de espera agotado"))
+    }
 
+    /// Las cuatro peticiones, ya dentro del plazo absoluto de `fetch()`.
+    private func fetchUsage(apiKey: String) async -> LimitsSnapshot {
         do {
-            let clock = ContinuousClock()
-            let deadline = clock.now + .seconds(5)
             let whoami = try await request(path: "/alpha/whoami", query: [
                 URLQueryItem(name: "limits", value: "1")
-            ], apiKey: apiKey, clock: clock, deadline: deadline)
+            ], apiKey: apiKey)
             guard let organization = Self.organization(from: whoami) else {
                 return .empty(source, .failed("Respuesta no reconocida"))
             }
             let organizationQuery = organization.query
 
+            // Solo credits es obligatoria: la suscripción y el resumen se piden aparte y,
+            // si fallan, `parse` recibe nil (B8) en vez de perder las ventanas de credits.
             async let creditsRequest = request(path: "/alpha/billing/credits",
                                                query: organizationQuery,
-                                               apiKey: apiKey,
-                                               clock: clock,
-                                               deadline: deadline)
-            async let subscriptionsRequest = request(path: "/alpha/billing/subscriptions",
-                                                     query: organizationQuery,
-                                                     apiKey: apiKey,
-                                                     clock: clock,
-                                                     deadline: deadline)
-            let (creditsData, subscriptionsData) = try await (creditsRequest, subscriptionsRequest)
+                                               apiKey: apiKey)
+            async let subscriptionsRequest: Data? = try? request(path: "/alpha/billing/subscriptions",
+                                                                 query: organizationQuery,
+                                                                 apiKey: apiKey)
+            let creditsData = try await creditsRequest
+            let subscriptionsData = await subscriptionsRequest
 
-            guard let subscription = Self.subscription(from: subscriptionsData) else {
-                return .empty(source, .failed("Respuesta no reconocida"))
+            if let subscriptionsData, let subscription = Self.subscription(from: subscriptionsData) {
+                let summaryData = try? await request(path: "/alpha/usage/summary", query:
+                    organizationQuery + [URLQueryItem(name: "since", value: subscription.currentPeriodStart)],
+                    apiKey: apiKey)
+                guard let snapshot = Self.parse(creditsData: creditsData,
+                                                subscriptionsData: subscriptionsData,
+                                                summaryData: summaryData) else {
+                    return .empty(source, .failed("Respuesta no reconocida"))
+                }
+                return snapshot
             }
-            let summaryData = try await request(path: "/alpha/usage/summary", query:
-                organizationQuery + [URLQueryItem(name: "since", value: subscription.currentPeriodStart)],
-                apiKey: apiKey,
-                clock: clock,
-                deadline: deadline)
-
             guard let snapshot = Self.parse(creditsData: creditsData,
-                                            subscriptionsData: subscriptionsData,
-                                            summaryData: summaryData) else {
+                                            subscriptionsData: nil,
+                                            summaryData: nil) else {
                 return .empty(source, .failed("Respuesta no reconocida"))
             }
             return snapshot
@@ -77,6 +86,9 @@ struct CommandCodeLimitsProvider: LimitsProvider {
             return .empty(source, .failed("HTTP \(status)"))
         } catch RequestError.invalidURL {
             return .empty(source, .failed("Respuesta no reconocida"))
+        } catch let error as URLError where error.code == .timedOut {
+            // B7: el timeout no es "Sin conexión".
+            return .empty(source, .failed("Tiempo de espera agotado"))
         } catch {
             Self.log.error("fallo de red: \(error.localizedDescription, privacy: .public)")
             return .empty(source, .failed("Sin conexión"))
@@ -114,13 +126,11 @@ struct CommandCodeLimitsProvider: LimitsProvider {
     }
 
     static func parse(creditsData: Data,
-                      subscriptionsData: Data,
-                      summaryData: Data) -> LimitsSnapshot? {
+                      subscriptionsData: Data?,
+                      summaryData: Data?) -> LimitsSnapshot? {
         guard let creditsRoot = try? JSONSerialization.jsonObject(with: creditsData) as? [String: Any],
               let credits = creditsRoot["credits"] as? [String: Any],
-              let windowLimits = creditsRoot["windowLimits"] as? [String: Any],
-              let subscription = subscription(from: subscriptionsData),
-              let summary = try? JSONSerialization.jsonObject(with: summaryData) as? [String: Any] else {
+              let windowLimits = creditsRoot["windowLimits"] as? [String: Any] else {
             return nil
         }
 
@@ -131,29 +141,44 @@ struct CommandCodeLimitsProvider: LimitsProvider {
         if let window = window(from: windowLimits["weekly"], name: "Semanal") {
             windows.append(window)
         }
-        // `monthlyCredits` de credits es lo que QUEDA del mes y `totalMonthlyCredits`
-        // del summary lo ya usado: el cupo mensual es la suma de ambos.
-        if let used = number(summary["totalMonthlyCredits"]),
-           let remaining = number(credits["monthlyCredits"]), remaining.isFinite, remaining >= 0,
-           let utilization = LimitWindow.utilization(used: used, cap: used + remaining) {
-            windows.append(LimitWindow(name: "Mes",
-                                       utilization: utilization,
-                                       resetsAt: date(from: subscription.currentPeriodEnd)))
+
+        // B8: la ventana "Mes" y la etiqueta del plan dependen de la suscripción y del
+        // resumen. Sin ellos, la fila sigue mostrando 5 horas y semanal.
+        if let subscriptionsData,
+           let subscription = subscription(from: subscriptionsData),
+           let summaryData,
+           let summary = try? JSONSerialization.jsonObject(with: summaryData) as? [String: Any] {
+            // `monthlyCredits` de credits es lo que QUEDA del mes y `totalMonthlyCredits`
+            // del summary lo ya usado: el cupo mensual es la suma de ambos.
+            if let used = number(summary["totalMonthlyCredits"]),
+               let remaining = number(credits["monthlyCredits"]), remaining.isFinite, remaining >= 0,
+               let utilization = LimitWindow.utilization(used: used, cap: used + remaining) {
+                windows.append(LimitWindow(name: "Mes",
+                                           utilization: utilization,
+                                           resetsAt: date(from: subscription.currentPeriodEnd)))
+            }
         }
         guard !windows.isEmpty else { return nil }
 
-        let plan = nonemptyString(credits["planId"]) ?? subscription.planID
-        let requests = number(summary["totalCount"]).flatMap { value -> Int? in
-            guard value.isFinite, value >= 0, value.rounded() == value else { return nil }
-            return Int(exactly: value)
+        var label: String? = nil
+        if let subscriptionsData,
+           let subscription = subscription(from: subscriptionsData),
+           let summaryData,
+           let summary = try? JSONSerialization.jsonObject(with: summaryData) as? [String: Any] {
+            let plan = nonemptyString(credits["planId"]) ?? subscription.planID
+            let requests = number(summary["totalCount"]).flatMap { value -> Int? in
+                guard value.isFinite, value >= 0, value.rounded() == value else { return nil }
+                return Int(exactly: value)
+            }
+            label = [plan, requests.map { "\($0) req" }]
+                .compactMap { $0 }
+                .joined(separator: " · ")
+            label = label?.isEmpty == false ? label : nil
         }
-        let label = [plan, requests.map { "\($0) req" }]
-            .compactMap { $0 }
-            .joined(separator: " · ")
 
         return LimitsSnapshot(source: .commandCode,
                               windows: windows,
-                              planLabel: label.isEmpty ? nil : label,
+                              planLabel: label,
                               status: .ok)
     }
 
@@ -193,7 +218,8 @@ struct CommandCodeLimitsProvider: LimitsProvider {
     }
 
     private static func date(from value: Any?) -> Date? {
-        if let timestamp = number(value), timestamp.isFinite, timestamp >= 0 {
+        // B3: `resetAt <= 0` significa "sin fecha" (nil), no 1970.
+        if let timestamp = number(value), timestamp.isFinite, timestamp > 0 {
             let seconds = timestamp > 10_000_000_000 ? timestamp / 1_000 : timestamp
             return Date(timeIntervalSince1970: seconds)
         }
@@ -215,11 +241,7 @@ struct CommandCodeLimitsProvider: LimitsProvider {
 
     private func request(path: String,
                          query: [URLQueryItem],
-                         apiKey: String,
-                         clock: ContinuousClock,
-                         deadline: ContinuousClock.Instant) async throws -> Data {
-        let remaining = clock.now.duration(to: deadline)
-        guard remaining > .zero else { throw URLError(.timedOut) }
+                         apiKey: String) async throws -> Data {
         guard var components = URLComponents(url: baseURL.appending(path: path),
                                              resolvingAgainstBaseURL: false) else {
             throw RequestError.invalidURL
@@ -227,8 +249,7 @@ struct CommandCodeLimitsProvider: LimitsProvider {
         components.queryItems = query
         guard let url = components.url else { throw RequestError.invalidURL }
         var request = URLRequest(url: url)
-        let parts = remaining.components
-        request.timeoutInterval = Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+        request.timeoutInterval = 5
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("cli", forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -237,7 +258,8 @@ struct CommandCodeLimitsProvider: LimitsProvider {
         if let http = response as? HTTPURLResponse {
             switch http.statusCode {
             case 200..<300: break
-            case 401, 403: throw RequestError.invalidCredentials
+            case 401: throw RequestError.invalidCredentials
+            case 403: throw RequestError.http(403)   // B13: transitorio, no credencial rota
             case 429: throw RequestError.rateLimited(RetryAfter.date(from: http))
             default: throw RequestError.http(http.statusCode)
             }

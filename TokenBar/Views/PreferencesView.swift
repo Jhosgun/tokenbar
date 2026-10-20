@@ -5,21 +5,20 @@ import SwiftUI
 /// Ventana de preferencias (id `preferences`). Se abre desde el menú ⚙︎ del dashboard.
 struct PreferencesView: View {
 
-    private static let cursorTokenKey = "cursor.sessionToken"
     private static let dataPathLabel = "~/Library/Application Support/TokenBar"
 
     @Bindable private var viewModel: UsageViewModel
 
     @State private var launchAtLogin = false
+    @State private var launchAtLoginStatus: SMAppService.Status = .notRegistered
     @State private var launchError: String?
-    @State private var cursorToken = ""
-    @State private var hasStoredToken = false
 
     @State private var notifier = ThresholdNotifier()
     // Se leen en la construcción de la vista, no en `onAppear`: así el `onChange`
     // del toggle no se dispara al sincronizar y no pide permisos sin que el usuario lo pida.
     @State private var notifyEnabled = ThresholdNotifier.isEnabled
     @State private var threshold = ThresholdNotifier.threshold
+    @State private var permissionStatus: ThresholdNotifier.PermissionStatus = .notDetermined
 
     init(viewModel: UsageViewModel) {
         self._viewModel = Bindable(viewModel)
@@ -29,12 +28,16 @@ struct PreferencesView: View {
         Form {
             generalSection
             notificationsSection
-            cursorSection
             dataSection
         }
         .formStyle(.grouped)
         .frame(width: 420, height: 320)
         .onAppear(perform: loadCurrentState)
+        // Al volver de Ajustes del sistema los permisos pudieron cambiar.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshLaunchAtLoginStatus()
+            Task { await refreshPermissionStatus() }
+        }
     }
 
     // MARK: - General
@@ -47,6 +50,17 @@ struct PreferencesView: View {
                 .onChange(of: launchAtLogin) { _, newValue in
                     applyLaunchAtLogin(newValue)
                 }
+
+            if launchAtLoginStatus == .requiresApproval {
+                Text("macOS pide aprobarlo en Ajustes del Sistema → General → Elementos de inicio")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Button("Abrir Ajustes") {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+                .controlSize(.small)
+            }
 
             if let launchError {
                 Text(launchError)
@@ -62,17 +76,19 @@ struct PreferencesView: View {
         let service = SMAppService.mainApp
         // Evita re-actuar cuando el toggle solo se está sincronizando con el sistema.
         guard (service.status == .enabled) != enabled else { return }
+        LaunchAtLogin.hasUserDecision = true
+
         do {
-            if enabled {
+            if LaunchAtLogin.shouldRegister(status: service.status, decided: !enabled) {
                 try service.register()
-            } else {
+            } else if !enabled {
                 try service.unregister()
             }
             launchError = nil
         } catch {
             launchError = "No se pudo cambiar el arranque automático: \(error.localizedDescription)"
-            launchAtLogin = service.status == .enabled
         }
+        refreshLaunchAtLoginStatus()
     }
 
     // MARK: - Notificaciones
@@ -82,8 +98,11 @@ struct PreferencesView: View {
             Toggle("Avisarme al superar un umbral diario", isOn: $notifyEnabled)
                 .onChange(of: notifyEnabled) { _, newValue in
                     ThresholdNotifier.isEnabled = newValue
-                    if newValue {
-                        Task { await notifier.requestAuthorizationIfNeeded() }
+                    Task {
+                        // Se espera el diálogo del sistema antes de releer el permiso: si no,
+                        // la lectura vería `.notDetermined` y nunca mostraría el rechazo.
+                        if newValue { await notifier.requestAuthorization() }
+                        await refreshPermissionStatus()
                     }
                 }
 
@@ -98,6 +117,15 @@ struct PreferencesView: View {
                 Text("Se avisa al pasar \(TokenFormatter.short(threshold)) tokens hoy. Solo una notificación por día.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if permissionStatus == .denied {
+                    Label("Permiso denegado", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+
+                    Button("Abrir Ajustes del sistema", action: openNotificationSettings)
+                        .controlSize(.small)
+                }
             }
         }
     }
@@ -111,51 +139,14 @@ struct PreferencesView: View {
         ThresholdNotifier.threshold = newValue
     }
 
-    // MARK: - Cursor
-
-    private var cursorSection: some View {
-        Section("Cursor") {
-            SecureField(
-                "Token de sesión",
-                text: $cursorToken,
-                prompt: Text(hasStoredToken ? "•••• guardado" : "WorkosCursorSessionToken")
-            )
-
-            Text("Sácalo de la cookie WorkosCursorSessionToken en cursor.com (DevTools → Application → Cookies).")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Text("La cuota se lee de endpoints internos de cursor.com usando tu sesión.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            HStack {
-                Button("Guardar", action: saveCursorToken)
-                    .disabled(trimmedToken.isEmpty)
-
-                Button("Borrar", role: .destructive, action: clearCursorToken)
-                    .disabled(!hasStoredToken)
-            }
-        }
+    private func refreshPermissionStatus() async {
+        permissionStatus = await notifier.permissionStatus()
     }
 
-    private var trimmedToken: String {
-        cursorToken.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func saveCursorToken() {
-        let value = trimmedToken
-        guard !value.isEmpty else { return }
-        Keychain.set(value, forKey: Self.cursorTokenKey)
-        // No se deja el token en memoria de la vista una vez guardado.
-        cursorToken = ""
-        hasStoredToken = true
-    }
-
-    private func clearCursorToken() {
-        Keychain.set(nil, forKey: Self.cursorTokenKey)
-        cursorToken = ""
-        hasStoredToken = false
+    private func openNotificationSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+            ?? URL(string: "x-apple.systempreferences:com.apple.preference.notifications") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     // MARK: - Datos
@@ -186,9 +177,13 @@ struct PreferencesView: View {
     // MARK: - Estado inicial
 
     private func loadCurrentState() {
-        launchAtLogin = SMAppService.mainApp.status == .enabled
-        hasStoredToken = Keychain.get(forKey: Self.cursorTokenKey)?.isEmpty == false
-        cursorToken = ""
+        refreshLaunchAtLoginStatus()
+        Task { await refreshPermissionStatus() }
+    }
+
+    private func refreshLaunchAtLoginStatus() {
+        launchAtLoginStatus = SMAppService.mainApp.status
+        launchAtLogin = launchAtLoginStatus == .enabled
     }
 }
 

@@ -14,6 +14,17 @@ struct NetworkDeadlineTests {
         func set(_ newValue: Bool) { lock.lock(); defer { lock.unlock() }; storage = newValue }
     }
 
+    /// Espera a que `flag` se encienda, con tope: las tareas de fondo que `run` no espera
+    /// fijan sus banderas en un momento que el test no controla, y dormir un tiempo fijo
+    /// solo apuesta al scheduling.
+    private func espera(_ flag: LockedFlag, hasta limite: Duration = .seconds(2)) async -> Bool {
+        let fin = ContinuousClock.now + limite
+        while !flag.value, ContinuousClock.now < fin {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return flag.value
+    }
+
     @Test("un trabajo rápido devuelve su valor sin esperar el presupuesto")
     func trabajoRapido() async {
         let resultado = await NetworkDeadline.run(budget: .seconds(5)) { 42 }
@@ -40,8 +51,7 @@ struct NetworkDeadlineTests {
         #expect(terminado.value == false)
 
         // El trabajo sigue en segundo plano: termina después, aunque a nadie le importe ya.
-        try? await Task.sleep(for: .milliseconds(500))
-        #expect(terminado.value == true)
+        #expect(await espera(terminado))
     }
 
     @Test("por defecto, al vencer el plazo se cancela la tarea de trabajo")
@@ -65,9 +75,8 @@ struct NetworkDeadlineTests {
         }
         #expect(resultado == nil)
 
-        // Da tiempo a que la cancelación se propague y el `catch` corra.
-        try? await Task.sleep(for: .milliseconds(300))
-        #expect(cancelado.value == true)
+        // La cancelación se propaga y el `catch` corre en la tarea de fondo.
+        #expect(await espera(cancelado))
         #expect(terminado.value == false)
     }
 
@@ -89,8 +98,30 @@ struct NetworkDeadlineTests {
 
         // Sin cancelar, el `Task.sleep` de adentro no se interrumpe: termina por su cuenta,
         // y su resultado queda disponible aunque `run` ya haya vuelto.
-        try? await Task.sleep(for: .milliseconds(300))
+        #expect(await espera(terminado))
         #expect(cancelado.value == false)
-        #expect(terminado.value == true)
+    }
+
+    @Test("la cancelación de quien llama se propaga al trabajo en curso")
+    func propagaLaCancelacionDelLlamador() async {
+        let cancelado = LockedFlag()
+        let tarea = Task {
+            await NetworkDeadline.run(budget: .seconds(30)) {
+                do {
+                    try await Task.sleep(for: .seconds(30))
+                    return 42
+                } catch {
+                    // Antes del arreglo, este trabajo seguía vivo aunque quien llamó a
+                    // `run` ya hubiera cancelado: la cancelación no llegaba hasta aquí.
+                    cancelado.set(true)
+                    return -1
+                }
+            }
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+        tarea.cancel()
+        _ = await tarea.value
+        // `run` vuelve al llamador antes de que el trabajo cancelado llegue a su `catch`.
+        #expect(await espera(cancelado))
     }
 }

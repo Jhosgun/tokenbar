@@ -29,22 +29,35 @@ enum NetworkDeadline {
         _ work: @escaping @Sendable () async -> T
     ) async -> T? {
         let gate = FirstResume()
-        return await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
-            let workTask = Task {
-                let result = await work()
-                await gate.resume(continuation, with: result)
+        let box = RunBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+                let workTask = Task {
+                    let result = await work()
+                    if await gate.resume(continuation, with: result) {
+                        // Ganó el trabajo: no dejes al temporizador durmiendo el presupuesto
+                        // entero de más.
+                        box.cancelTimer()
+                    }
+                }
+                let timerTask = Task {
+                    try? await Task.sleep(for: budget)
+                    // Reclama la compuerta ANTES de cancelar: todos los proveedores de red
+                    // atrapan la cancelación, así que cancelar primero podría hacer que
+                    // `work` termine y llame a `gate.resume` con su propio valor antes de que
+                    // este `await` llegue al actor — el vencimiento se disfrazaría de un
+                    // resultado normal, de forma intermitente. Resuelto el `nil` primero, la
+                    // reanudación posterior de `work` (cancelado o no) ya no tiene efecto.
+                    if await gate.resume(continuation, with: nil) {
+                        if cancelOnTimeout { workTask.cancel() }
+                    }
+                }
+                box.set(work: workTask, timer: timerTask)
             }
-            Task {
-                try? await Task.sleep(for: budget)
-                // Reclama la compuerta ANTES de cancelar: todos los proveedores de red
-                // atrapan la cancelación, así que cancelar primero podría hacer que
-                // `work` termine y llame a `gate.resume` con su propio valor antes de que
-                // este `await` llegue al actor — el vencimiento se disfrazaría de un
-                // resultado normal, de forma intermitente. Resuelto el `nil` primero, la
-                // reanudación posterior de `work` (cancelado o no) ya no tiene efecto.
-                await gate.resume(continuation, with: nil)
-                if cancelOnTimeout { workTask.cancel() }
-            }
+        } onCancel: {
+            // La cancelación de quien llama se propaga a ambas tareas internas, en vez de
+            // dejarlas huérfanas (o al temporizador durmiendo hasta que venza).
+            box.cancelAll()
         }
     }
 
@@ -52,10 +65,51 @@ enum NetworkDeadline {
     private actor FirstResume {
         private var resumed = false
 
-        func resume<T: Sendable>(_ continuation: CheckedContinuation<T, Never>, with value: T) {
-            guard !resumed else { return }
+        func resume<T: Sendable>(_ continuation: CheckedContinuation<T, Never>, with value: T) -> Bool {
+            guard !resumed else { return false }
             resumed = true
             continuation.resume(returning: value)
+            return true
+        }
+    }
+
+    /// Guarda las dos tareas internas para poder cancelarlas desde fuera. La cancelación
+    /// puede llegar antes de que `set` corra, así que se registra la intención y se aplica
+    /// en cuanto las tareas existen.
+    private final class RunBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var workTask: Task<Void, Never>?
+        private var timerTask: Task<Void, Never>?
+        private var cancelled = false
+
+        func set(work: Task<Void, Never>, timer: Task<Void, Never>) {
+            lock.lock()
+            workTask = work
+            timerTask = timer
+            let cancel = cancelled
+            lock.unlock()
+            if cancel {
+                work.cancel()
+                timer.cancel()
+            }
+        }
+
+        func cancelTimer() {
+            lock.lock()
+            let timer = timerTask
+            timerTask = nil
+            lock.unlock()
+            timer?.cancel()
+        }
+
+        func cancelAll() {
+            lock.lock()
+            cancelled = true
+            let work = workTask
+            let timer = timerTask
+            lock.unlock()
+            work?.cancel()
+            timer?.cancel()
         }
     }
 }

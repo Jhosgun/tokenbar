@@ -83,17 +83,20 @@ actor CursorBreakdownStore {
         }
     }
 
-    /// Suma un evento nuevo (el collector ya lo deduplicó) a su día, modelo y origen.
+    /// Suma el delta de un evento (el collector ya restó lo contabilizado antes) a su día,
+    /// modelo y origen. El evento se cuenta una sola vez, al verse por primera vez
+    /// (`isNewEvent`); las relecturas de un evento que creció en sitio solo suman tokens.
     /// No persiste: el collector llama a `save()` una vez al final del ciclo.
-    func record(day: String, model: String, isHeadless: Bool, tokens: Int) async {
+    func record(day: String, model: String, isHeadless: Bool, tokens: Int,
+                isNewEvent: Bool = true) async {
         guard tokens > 0 else { return }
         var bucket = days[day]?[model] ?? Bucket()
         if isHeadless {
             bucket.cliTokens += tokens
-            bucket.cliEvents += 1
+            if isNewEvent { bucket.cliEvents += 1 }
         } else {
             bucket.appTokens += tokens
-            bucket.appEvents += 1
+            if isNewEvent { bucket.appEvents += 1 }
         }
         days[day, default: [:]][model] = bucket
         isDirty = true

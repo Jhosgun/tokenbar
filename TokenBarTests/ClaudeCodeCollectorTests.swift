@@ -567,7 +567,7 @@ struct ClaudeCodeCollectorTests {
         await harness.state.save()
 
         let migrated = try stateJSON(in: harness.stateDirectory)
-        #expect(migrated["version"] as? Int == 2)
+        #expect(migrated["version"] as? Int == 4)
         #expect(migrated["seenMessageIDs"] as? [String] == ["foreign-id", "foreign-id#12"])
         let messages = try #require(migrated["claudeMessages"] as? [[String: Any]])
         #expect(messages.count == 1)
@@ -586,7 +586,7 @@ struct ClaudeCodeCollectorTests {
         let attributes = try FileManager.default.attributesOfItem(atPath: transcript.path)
         let modified = try #require(attributes[.modificationDate] as? Date)
         let future: [String: Any] = [
-            "version": 3,
+            "version": 4,
             "bootstrapped": ["claudeCode"],
             "cursors": [transcript.path: [
                 "offset": Data(line.utf8).count,

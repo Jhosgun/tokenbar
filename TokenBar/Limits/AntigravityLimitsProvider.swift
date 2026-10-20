@@ -1,13 +1,13 @@
 import Foundation
 import OSLog
+import Darwin
 
-/// Cuota de la suscripción de Antigravity, leída de su **CLI** (`agy`).
+/// Cuota de la suscripción de Antigravity, consultada en el endpoint de Google con la
+/// credencial del CLI y, si esta no está disponible o es rechazada, mediante `agy -p /usage`.
 ///
-/// Esta fila cubre el **CLI**, no el IDE: su cuota no está en ningún archivo, vive en memoria del
-/// CLI. Pero `agy -p /usage` la imprime en modo print — según el changelog del CLI es de
-/// solo lectura: no inicia un turno de agente ni gasta cuota (verificado en este Mac,
-/// tarda ~6 s). La salida son líneas tabuladas con grupo de modelos, ventana, **restante**
-/// en porcentaje y fecha de reinicio ISO-8601:
+/// El endpoint devuelve los buckets reales de cuota. El CLI queda como respaldo porque
+/// renueva por su cuenta la credencial del llavero. Su salida son líneas tabuladas con grupo
+/// de modelos, ventana, **restante** en porcentaje y fecha de reinicio ISO-8601:
 ///
 /// ```
 /// Gemini Models	Weekly Limit Remaining	100%	2026-10-04T23:18:52Z
@@ -39,6 +39,22 @@ struct AntigravityLimitsProvider: LimitsProvider {
 
     /// Ejecutor del CLI. Inyectable para que los tests no lancen procesos de verdad.
     typealias CLIRunner = @Sendable (URL) async -> CLIOutput
+    typealias CredentialRead = @Sendable () async -> KeychainCredentialReadResult
+
+    struct Credential: Equatable, Sendable {
+        var accessToken: String
+        var expiresAt: Date
+    }
+
+    private enum EndpointResult: Sendable {
+        case snapshot(LimitsSnapshot)
+        case fallbackToCLI
+        case failed(String)
+    }
+
+    enum Endpoint {
+        static let quota = URL(string: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")!
+    }
 
     /// El CLI tarda ~6 s; 30 s es margen de sobra antes de matarlo.
     static let processTimeout: TimeInterval = 30
@@ -49,6 +65,10 @@ struct AntigravityLimitsProvider: LimitsProvider {
     /// si el CLI tarda más, la ejecución sigue en segundo plano y su resultado entra en el
     /// ciclo siguiente, en vez de frenar a las demás fuentes.
     static let fetchBudget: Duration = .seconds(5)
+    /// B5: el CLI tarda ~6 s, más que el presupuesto normal de 5 s. En la primera corrida
+    /// tras arrancar (sin nada en caché) se espera un poco más, para que la fila no quede
+    /// 5 minutos en "Consultando…" mientras el CLI termina en segundo plano.
+    static let firstRunBudget: Duration = .seconds(10)
 
     /// Rutas donde puede vivir el binario, en orden de preferencia. No se confía en el
     /// PATH del `.app`, que lanzado desde Finder es mínimo.
@@ -62,48 +82,152 @@ struct AntigravityLimitsProvider: LimitsProvider {
 
     private let candidates: [URL]
     private let run: CLIRunner
+    private let session: URLSession
+    private let credentialRead: CredentialRead
+    private let now: @Sendable () -> Date
     private let cache: CLICache
     private let budget: Duration
+    private let firstRunBudget: Duration
 
     init(candidates: [URL] = AntigravityLimitsProvider.candidateBinaries,
          cliInterval: TimeInterval = AntigravityLimitsProvider.cliInterval,
          budget: Duration = AntigravityLimitsProvider.fetchBudget,
+         firstRunBudget: Duration = AntigravityLimitsProvider.firstRunBudget,
+         session: URLSession = .shared,
+         now: @escaping @Sendable () -> Date = Date.init,
+         credentialRead: CredentialRead? = nil,
          run: @escaping CLIRunner = { await AntigravityLimitsProvider.runCLI(at: $0) }) {
         self.candidates = candidates
         self.run = run
+        self.session = session
+        if let credentialRead {
+            self.credentialRead = credentialRead
+        } else {
+            let reader = KeychainCredentialReader(service: "gemini", account: "antigravity")
+            self.credentialRead = { await reader.read() }
+        }
+        self.now = now
         self.cache = CLICache(interval: cliInterval)
         self.budget = budget
+        self.firstRunBudget = firstRunBudget
     }
 
     func fetch() async -> LimitsSnapshot {
-        // La detección se repite en cada ciclo: es barata (un stat por ruta) y si se
-        // instala el CLI con la app abierta, la fila aparece sola sin reiniciar.
+        let runBudget = await cache.isEmpty ? firstRunBudget : budget
+        let current = now()
+        let work: @Sendable () async -> Void = { [self] in
+            let snapshot = await fetchFresh(now: current)
+            let completedAt = now()
+            await cache.store(snapshot, at: completedAt)
+        }
+        guard let task = await cache.run(now: current, work: work) else {
+            return await cache.current(now: current) ?? .empty(source, .failed("Sin datos de cuota"))
+        }
+
+        _ = await NetworkDeadline.run(budget: runBudget, cancelOnTimeout: false) {
+            await task.value
+        }
+
+        return await cache.current(now: now())
+            ?? .empty(source, .failed("Consultando la cuota…"))
+    }
+
+    private func fetchFresh(now current: Date) async -> LimitsSnapshot {
+        if let credential = Self.credential(from: await credentialRead()),
+           credential.expiresAt.timeIntervalSince(current) > 60 {
+            switch await fetchEndpoint(token: credential.accessToken) {
+            case .snapshot(let snapshot):
+                return snapshot
+            case .failed(let message):
+                return .empty(source, .failed(message))
+            case .fallbackToCLI:
+                break
+            }
+        }
+
         guard let binary = Self.findBinary(in: candidates) else {
             return .empty(source, .notConfigured)
         }
+        return Self.snapshot(from: await run(binary), now: now())
+    }
 
-        let now = Date()
-        guard await cache.shouldRun(now: now) else {
-            // Válvula cerrada: lo último que dio el CLI, sin lanzar nada. La marca de dato
-            // viejo la pone la caché, así que sobrevive a los ciclos en que no se ejecuta.
-            return await cache.current(now: now) ?? .empty(source, .failed("Sin datos de cuota"))
+    // MARK: - Endpoint
+
+    private func fetchEndpoint(token: String) async -> EndpointResult {
+        var request = URLRequest(url: Endpoint.quota)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 5
+        request.httpBody = Data("{}".utf8)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let configuredRequest = request
+
+        let response = await NetworkDeadline.run(budget: Self.fetchBudget) { [session] in
+            do {
+                let (data, response) = try await session.data(for: configuredRequest)
+                guard let response = response as? HTTPURLResponse else {
+                    return EndpointResult.failed("Sin conexión")
+                }
+                switch response.statusCode {
+                case 200..<300:
+                    guard let snapshot = Self.parseEndpoint(data) else {
+                        return EndpointResult.failed("Respuesta no reconocida")
+                    }
+                    return EndpointResult.snapshot(snapshot)
+                case 401, 403:
+                    return EndpointResult.fallbackToCLI
+                default:
+                    return EndpointResult.failed("HTTP \(response.statusCode)")
+                }
+            } catch {
+                return EndpointResult.failed("Sin conexión")
+            }
         }
+        return response ?? .failed("Tiempo de espera agotado")
+    }
 
-        // La ejecución vive en su propia tarea: si se pasa del presupuesto, `fetch()`
-        // devuelve lo último conocido y la tarea sigue, guardando su resultado para el
-        // ciclo siguiente. `NetworkDeadline` no espera a `work` si se pasa del plazo —ver
-        // su doc— así que esto no bloquea aunque el CLI tarde de más.
-        //
-        // `cancelOnTimeout: false`: a diferencia de una petición de red, este CLI ya
-        // consumió los segundos que tardó en arrancar. Cancelarlo tiraría ese trabajo y el
-        // ciclo siguiente volvería a pagarlo entero; dejarlo correr aprovecha el resultado
-        // en cuanto llegue, vía la caché.
-        _ = await NetworkDeadline.run(budget: budget, cancelOnTimeout: false) { [run, cache] in
-            await cache.store(Self.snapshot(from: await run(binary)), at: Date())
+    static func credential(from result: KeychainCredentialReadResult) -> Credential? {
+        guard case .credential(let raw) = result else { return nil }
+        return credential(from: raw)
+    }
+
+    static func credential(from raw: String?) -> Credential? {
+        let prefix = "go-keyring-base64:"
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              raw.hasPrefix(prefix),
+              let data = Data(base64Encoded: String(raw.dropFirst(prefix.count))),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = root["token"] as? [String: Any],
+              let accessToken = token["access_token"] as? String, !accessToken.isEmpty,
+              let expiry = token["expiry"] as? String,
+              let expiresAt = resetDate(expiry) else { return nil }
+        return Credential(accessToken: accessToken, expiresAt: expiresAt)
+    }
+
+    static func parseEndpoint(_ data: Data) -> LimitsSnapshot? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let groups = root["groups"] as? [[String: Any]] else { return nil }
+        var windows: [LimitWindow] = []
+        var seen: Set<String> = []
+        for group in groups {
+            guard let displayName = group["displayName"] as? String,
+                  let groupLabel = groupLabel(displayName),
+                  let buckets = group["buckets"] as? [[String: Any]] else { continue }
+            for bucket in buckets {
+                guard let displayName = bucket["displayName"] as? String,
+                      let windowLabel = windowLabel(displayName) else { continue }
+                guard let raw = (bucket["remainingFraction"] as? NSNumber)?.doubleValue,
+                      raw.isFinite, (0...1).contains(raw) else { return nil }
+                let name = "\(groupLabel) \(windowLabel)"
+                guard seen.insert(name).inserted else { continue }
+                let reset = (bucket["resetTime"] as? String).flatMap(resetDate)
+                windows.append(LimitWindow(name: name, utilization: 1 - raw, resetsAt: reset))
+            }
         }
-
-        return await cache.current(now: Date())
-            ?? .empty(source, .failed("Consultando la cuota…"))
+        guard !windows.isEmpty else { return nil }
+        let ordered = windows.filter { $0.name.hasSuffix("5 horas") }
+            + windows.filter { !$0.name.hasSuffix("5 horas") }
+        return LimitsSnapshot(source: .antigravity, windows: ordered, planLabel: nil, status: .ok)
     }
 
     // MARK: - Binario
@@ -117,7 +241,7 @@ struct AntigravityLimitsProvider: LimitsProvider {
 
     /// Convierte la salida cruda del CLI en un snapshot. Nunca lanza: cualquier cosa
     /// irreconocible se reporta como `.failed` en vez de inventar cifras.
-    static func snapshot(from output: CLIOutput) -> LimitsSnapshot {
+    static func snapshot(from output: CLIOutput, now: Date = Date()) -> LimitsSnapshot {
         // Si salieron ventanas parseables, ese dato manda aunque el proceso se quejara.
         if let parsed = parse(output.stdout) {
             return parsed
@@ -242,7 +366,14 @@ struct AntigravityLimitsProvider: LimitsProvider {
     /// Ejecuta `agy -p /usage` y captura su salida. No bloquea el hilo que la llama: la
     /// espera la hace el `terminationHandler` del proceso, y un timer lo mata a los 30 s.
     static func runCLI(at binary: URL) async -> CLIOutput {
-        await CLIRun(binary: binary, timeout: processTimeout).start()
+        await CLIRun(binary: binary, arguments: ["-p", "/usage"], timeout: processTimeout).start()
+    }
+
+    /// Corrida genérica de un binario, expuesta para que los tests puedan ejercitar el
+    /// manejo de tuberías y timeout sin lanzar el `agy` real.
+    static func runCommand(binary: URL, arguments: [String],
+                           timeout: TimeInterval = processTimeout) async -> CLIOutput {
+        await CLIRun(binary: binary, arguments: arguments, timeout: timeout).start()
     }
 
     /// Válvula + caché del resultado: el CLI no corre más de una vez cada `interval`
@@ -261,17 +392,51 @@ struct AntigravityLimitsProvider: LimitsProvider {
             self.interval = interval
         }
 
+        /// True si todavía no hay ningún resultado guardado (primera corrida).
+        var isEmpty: Bool {
+            lastResult == nil
+        }
+
         /// Devuelve true si toca ejecutar el CLI y registra el intento; false si aún no
-        /// pasó `interval` desde el último.
+        /// pasó `interval` desde el último `.ok`. B4: la válvula solo se cierra tras un
+        /// resultado `.ok`; un fallo se reintenta en el siguiente ciclo.
         func shouldRun(now: Date) -> Bool {
-            if let lastAttempt, now.timeIntervalSince(lastAttempt) < interval { return false }
+            if case .ok = lastResult?.status {
+                if let lastAttempt, now.timeIntervalSince(lastAttempt) < interval { return false }
+            }
             lastAttempt = now
             return true
         }
 
+        /// La corrida en curso, si la hay: un refresco manual que llega mientras el CLI
+        /// sigue en segundo plano espera a esa misma corrida en vez de lanzar un segundo
+        /// `agy`. Se libera al terminar, sea con éxito o con error, así que un fallo sigue
+        /// siendo reintentable.
+        private var inFlight: Task<Void, Never>?
+
+        /// La corrida a esperar: la que ya está en curso o una nueva si toca ejecutar el
+        /// CLI; nil si la válvula está cerrada.
+        func run(now: Date, work: @escaping @Sendable () async -> Void) -> Task<Void, Never>? {
+            if let inFlight { return inFlight }
+            guard shouldRun(now: now) else { return nil }
+            let task = Task {
+                await work()
+                self.finishRun()
+            }
+            inFlight = task
+            return task
+        }
+
+        private func finishRun() {
+            inFlight = nil
+        }
+
         func store(_ snapshot: LimitsSnapshot, at date: Date) {
-            lastResult = snapshot
-            if case .ok = snapshot.status { lastGood = (snapshot, date) }
+            // B18: el dato servido desde caché lleva su fecha real, no la de la consulta.
+            var stored = snapshot
+            stored.dataAsOf = date
+            lastResult = stored
+            if case .ok = stored.status { lastGood = (stored, date) }
         }
 
         /// Lo que hay que mostrar ahora: el último resultado, salvo que haya fallado sin
@@ -298,12 +463,23 @@ struct AntigravityLimitsProvider: LimitsProvider {
         private let stderr = Pipe()
         private let timeout: TimeInterval
         private let lock = NSLock()
+        private let dataLock = NSLock()
         private var continuation: CheckedContinuation<CLIOutput, Never>?
         private var timedOut = false
+        private var stdoutData = Data()
+        private var stderrData = Data()
+        /// Se libera cuando cada tubería llega a EOF: la terminación del proceso espera a
+        /// que el último `readabilityHandler` haya anexado su trozo antes de armar la salida.
+        private let eof = DispatchGroup()
+        private var closedPipes: Set<ObjectIdentifier> = []
 
-        init(binary: URL, timeout: TimeInterval) {
+        /// Tiempo máximo que la terminación espera el EOF. Si un hijo heredó el descriptor
+        /// la tubería no cierra nunca, y sin este tope el hijo colgaría la corrida.
+        private static let eofGrace: DispatchTimeInterval = .milliseconds(500)
+
+        init(binary: URL, arguments: [String], timeout: TimeInterval) {
             process.executableURL = binary
-            process.arguments = ["-p", "/usage"]
+            process.arguments = arguments
             process.standardOutput = stdout
             process.standardError = stderr
             self.timeout = timeout
@@ -315,12 +491,33 @@ struct AntigravityLimitsProvider: LimitsProvider {
                 self.continuation = continuation
                 lock.unlock()
 
+                // B14: se lee mientras el proceso corre. Si nadie drenara las tuberías y la
+                // salida superara el buffer (64 KB), el proceso se quedaría bloqueado
+                // escribiendo y solo lo sacaría el timeout.
+                eof.enter()
+                stdout.fileHandleForReading.readabilityHandler = { [self] handle in
+                    drain(handle, into: \.stdoutData)
+                }
+                eof.enter()
+                stderr.fileHandleForReading.readabilityHandler = { [self] handle in
+                    drain(handle, into: \.stderrData)
+                }
+
                 process.terminationHandler = { [self] process in
                     process.terminationHandler = nil
-                    let out = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(),
-                                     as: UTF8.self)
-                    let err = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(),
-                                     as: UTF8.self)
+                    // B14: el proceso puede terminar antes de que el último callback de
+                    // lectura anexe su trozo, así que se espera (con tope) a que ambas
+                    // tuberías lleguen a EOF. No se usa `readDataToEndOfFile`: con un hijo
+                    // que heredara el descriptor colgaría para siempre.
+                    _ = eof.wait(timeout: .now() + Self.eofGrace)
+                    stdout.fileHandleForReading.readabilityHandler = nil
+                    stderr.fileHandleForReading.readabilityHandler = nil
+                    dataLock.lock()
+                    let out = String(decoding: stdoutData, as: UTF8.self)
+                    let err = String(decoding: stderrData, as: UTF8.self)
+                    dataLock.unlock()
+                    try? stdout.fileHandleForReading.close()
+                    try? stderr.fileHandleForReading.close()
                     lock.lock()
                     let wasTimedOut = timedOut
                     lock.unlock()
@@ -328,14 +525,19 @@ struct AntigravityLimitsProvider: LimitsProvider {
                                      exitCode: process.terminationStatus, timedOut: wasTimedOut))
                 }
 
-                // El timeout vive aparte: si el proceso sigue vivo al vencer, se mata y el
-                // handler de arriba reporta la salida (vacía o parcial) como timeout.
+                // El timeout vive aparte: SIGTERM al vencer y, si el proceso no muere a los
+                // 2 s, SIGKILL de respaldo.
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [self] in
                     if process.isRunning {
                         lock.lock()
                         timedOut = true
                         lock.unlock()
                         process.terminate()
+                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [self] in
+                            if process.isRunning {
+                                kill(process.processIdentifier, SIGKILL)
+                            }
+                        }
                     }
                 }
 
@@ -344,8 +546,24 @@ struct AntigravityLimitsProvider: LimitsProvider {
                 } catch {
                     AntigravityLimitsProvider.log.error(
                         "no se pudo lanzar agy: \(error.localizedDescription, privacy: .public)")
+                    stdout.fileHandleForReading.readabilityHandler = nil
+                    stderr.fileHandleForReading.readabilityHandler = nil
                     finish(CLIOutput(stdout: "", stderr: "", exitCode: nil, timedOut: false))
                 }
+            }
+        }
+
+        /// Anexa lo disponible en la tubería; en EOF desarma el handler y libera `eof`.
+        private func drain(_ handle: FileHandle, into buffer: ReferenceWritableKeyPath<CLIRun, Data>) {
+            let chunk = handle.availableData
+            dataLock.lock()
+            defer { dataLock.unlock() }
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                // `leave` una sola vez por tubería, aunque el handler vuelva a dispararse.
+                if closedPipes.insert(ObjectIdentifier(handle)).inserted { eof.leave() }
+            } else {
+                self[keyPath: buffer].append(chunk)
             }
         }
 

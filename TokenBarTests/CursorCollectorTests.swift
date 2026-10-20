@@ -130,9 +130,11 @@ struct CursorCollectorTests {
 
     /// Arma un evento con la forma real de `get-filtered-usage-events`. `tokenUsage: nil`
     /// omite el campo por completo, como hacen los eventos que no son de tokens.
+    /// `cacheWrite` solo se incluye si se pasa: la API real lo omite casi siempre.
     private static func eventJSON(timestampMs: Int64, model: String = "default",
                                   isHeadless: Bool = false, conversationId: String? = "conv-1",
                                   input: Int = 0, output: Int = 0, cacheRead: Int = 0,
+                                  cacheWrite: Int? = nil,
                                   totalCents: Double? = nil,
                                   hasTokenUsage: Bool = true) -> [String: Any] {
         var json: [String: Any] = [
@@ -150,6 +152,7 @@ struct CursorCollectorTests {
         if hasTokenUsage {
             var usage: [String: Any] = ["inputTokens": input, "outputTokens": output,
                                         "cacheReadTokens": cacheRead]
+            if let cacheWrite { usage["cacheWriteTokens"] = cacheWrite }
             if let totalCents { usage["totalCents"] = totalCents }
             json["tokenUsage"] = usage
         }
@@ -260,6 +263,35 @@ struct CursorCollectorTests {
         #expect(record.cacheReadTokens == 456_384)
         #expect(abs(record.costUSD - 0.7825) < 1e-9)
         #expect(record.day == DayKey.string(from: Date(timeIntervalSince1970: Double(timestamp) / 1000)))
+    }
+
+    @Test("modelRecords: un registro por modelo (nombre corto) que cumple el invariante")
+    func modelRecordsPorModelo() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        StubURLProtocol.setHandler { _ in
+            let events = [
+                Self.eventJSON(timestampMs: now, model: "cursor-grok-4.6-high",
+                               conversationId: "c1", input: 100, output: 20, cacheRead: 300,
+                               totalCents: 50),
+                Self.eventJSON(timestampMs: now - 1_000, model: "cursor-grok-4.6-high",
+                               isHeadless: true, conversationId: "c2", input: 10, output: 2),
+                Self.eventJSON(timestampMs: now - 2_000, model: "default",
+                               conversationId: "c3", input: 7, output: 3, totalCents: 1)
+            ]
+            return (200, Self.responseData(events: events))
+        }
+
+        let result = await harness.collector().collect()
+
+        #expect(result.status == .ok)
+        StatsSupport.expectInvariant(result)
+        #expect(StatsSupport.total(result) == 442)
+        let grok = try #require(result.modelRecords.first { $0.model == "grok-4.6-high" })
+        #expect(grok.source == .cursor)
+        #expect(grok.totalTokens == 432)
+        #expect(result.modelRecords.contains { $0.model == "default" })
     }
 
     @Test("un evento sin tokenUsage no se cuenta pero no rompe el parseo")
@@ -398,6 +430,38 @@ struct CursorCollectorTests {
         #expect(result.records.isEmpty)
     }
 
+    @Test("un error de lectura es .failed con el código SQLite, no no-configurado, y no hace red")
+    func errorDeLectura() async throws {
+        let harness = try Harness(withCredential: false)
+        defer { harness.cleanUp() }
+        try Data("no es una base".utf8).write(to: harness.databaseURL)
+        StubURLProtocol.setHandler { _ in
+            Issue.record("no debía hacer una petición")
+            return (500, Data())
+        }
+
+        let result = await harness.collector().collect()
+        #expect(result.status == .failed("No se pudo leer la sesión de Cursor (SQLite 26)"))
+        #expect(result.records.isEmpty)
+    }
+
+    @Test("un fallo de lectura usa la credencial del ciclo anterior del mismo collector")
+    func credencialRecordada() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        StubURLProtocol.setHandler { _ in (200, Data("{}".utf8)) }
+        let collector = harness.collector()
+
+        #expect(await collector.collect().status == .ok)
+
+        try Data("no es una base".utf8).write(to: harness.databaseURL)
+        #expect(await collector.collect().status == .ok)
+
+        // Otro collector sin historia sí reporta el fallo.
+        #expect(await harness.collector().collect().status
+                == .failed("No se pudo leer la sesión de Cursor (SQLite 26)"))
+    }
+
     @Test("un JWT vencido reporta credenciales inválidas sin red")
     func jwtVencido() async throws {
         let harness = try Harness(expired: true)
@@ -518,19 +582,43 @@ struct CursorCollectorTests {
         #expect(await harness.state.cursorLastEventTimestamp() == nil)
     }
 
-    @Test("renombrar UN SOLO contador de tokenUsage también falla, en vez de contarlo como cero")
-    func unSoloContadorRenombradoFalla() async throws {
+    @Test("un contador ausente entre otros reconocibles vale 0: la página no falla y la marca avanza")
+    func unContadorAusenteValeCero() async throws {
         let harness = try Harness()
         defer { harness.cleanUp() }
         await harness.state.load()
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         StubURLProtocol.setHandler { _ in
-            // Cursor mantiene inputTokens y cacheReadTokens, pero renombra outputTokens a
-            // completionTokens. Si el clasificador aceptara el esquema con solo ALGUNO de
-            // los tres reconocido, este evento se contaría como 40+0+10=50 en vez de fallar
-            // — perdiendo los 50 tokens de `completionTokens` en silencio.
-            var event = Self.eventJSON(timestampMs: now, conversationId: "conv-parcial")
-            event["tokenUsage"] = ["inputTokens": 40, "completionTokens": 50, "cacheReadTokens": 10]
+            // Como en la API real (2026-10-06): `tokenUsage` sin `cacheReadTokens`. Antes se
+            // trataba como esquema desconocido y la marca de agua quedaba clavada ciclo
+            // tras ciclo (6 eventos así en 40 días bloqueaban TODO el consumo posterior).
+            var event = Self.eventJSON(timestampMs: now, conversationId: "conv-sin-cache-read")
+            event["tokenUsage"] = ["inputTokens": 40, "outputTokens": 10, "totalCents": 2.0]
+            return (200, Self.responseData(events: [event]))
+        }
+
+        let result = await harness.collector().collect()
+
+        #expect(result.status == .ok)
+        let record = try #require(result.records.first)
+        #expect(record.inputTokens == 40)
+        #expect(record.outputTokens == 10)
+        #expect(record.cacheReadTokens == 0)
+        #expect(record.cacheCreationTokens == 0)
+        #expect(abs(record.costUSD - 0.02) < 1e-9)
+        #expect(await harness.state.cursorLastEventTimestamp() == now)
+    }
+
+    @Test("un contador presente pero no numérico sigue siendo formato desconocido")
+    func contadorPresenteNoNumericoFalla() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        await harness.state.load()
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        StubURLProtocol.setHandler { _ in
+            // El campo existe pero cambió de forma: no hay manera segura de leerlo como 0.
+            var event = Self.eventJSON(timestampMs: now, conversationId: "conv-no-numerico")
+            event["tokenUsage"] = ["inputTokens": 40, "outputTokens": ["value": 10]]
             return (200, Self.responseData(events: [event]))
         }
 
@@ -539,6 +627,34 @@ struct CursorCollectorTests {
         #expect(result.status == .failed("formato de respuesta desconocido"))
         #expect(result.records.isEmpty)
         #expect(await harness.state.cursorLastEventTimestamp() == nil)
+    }
+
+    @Test("cacheWriteTokens llega a cacheCreationTokens y entra en el costo estimado")
+    func cacheWriteTokensLlegaACacheCreation() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        StubURLProtocol.setHandler { _ in
+            let event = Self.eventJSON(timestampMs: now, model: "claude-4.5-sonnet",
+                                       conversationId: "conv-cache-write",
+                                       input: 100, output: 10, cacheRead: 1_000, cacheWrite: 200)
+            return (200, Self.responseData(events: [event]))
+        }
+
+        let result = await harness.collector().collect()
+
+        #expect(result.status == .ok)
+        StatsSupport.expectInvariant(result)
+        let record = try #require(result.records.first)
+        #expect(record.cacheCreationTokens == 200)
+        #expect(record.totalTokens == 1_310)
+        // Sin `totalCents`, el costo se estima con `Pricing` incluyendo la caché de escritura.
+        let expected = Pricing.cost(model: "claude-4.5-sonnet", inputTokens: 100, outputTokens: 10,
+                                    cacheCreationTokens: 200, cacheReadTokens: 1_000)
+        #expect(expected > 0)
+        #expect(abs(record.costUSD - expected) < 1e-9)
+        let model = try #require(result.modelRecords.first)
+        #expect(model.cacheCreationTokens == 200)
     }
 
     @Test("un tokenUsage explícitamente en cero se reconoce y no cuenta, sin fallar")
@@ -555,6 +671,190 @@ struct CursorCollectorTests {
         let result = await harness.collector().collect()
         #expect(result.status == .ok)
         #expect(result.records.isEmpty)
+    }
+
+    // MARK: - Crecimiento en sitio (2026-10-06): cada relectura suma solo lo que creció
+
+    @Test("un evento que crece entre ciclos se cuenta por deltas: el total es la última foto, no la suma de fotos")
+    func eventoQueCreceSeCuentaPorDeltas() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        await harness.state.load()
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        // Mismo conversationId + timestamp en ambos ciclos: Cursor publica el evento al
+        // arrancar el turno y le va sumando tokens y centavos en sitio.
+        var snapshot = (input: 100, output: 10, cacheRead: 1_000, cacheWrite: 0, cents: 9.0)
+        StubURLProtocol.setHandler { _ in
+            let event = Self.eventJSON(timestampMs: now, model: "gpt-5.6-sol-high",
+                                       conversationId: "conv-crece",
+                                       input: snapshot.input, output: snapshot.output,
+                                       cacheRead: snapshot.cacheRead, cacheWrite: snapshot.cacheWrite,
+                                       totalCents: snapshot.cents)
+            return (200, Self.responseData(events: [event]))
+        }
+
+        let first = await harness.collector().collect()
+        #expect(first.status == .ok)
+        #expect(StatsSupport.total(first) == 1_110)
+
+        snapshot = (100, 25, 5_000, 200, 17.1)
+        let second = await harness.collector().collect()
+        #expect(second.status == .ok)
+        StatsSupport.expectInvariant(second)
+        let delta = try #require(second.records.first)
+        #expect(delta.inputTokens == 0)
+        #expect(delta.outputTokens == 15)
+        #expect(delta.cacheReadTokens == 4_000)
+        #expect(delta.cacheCreationTokens == 200)
+
+        // Suma de ambos ciclos: exactamente la última foto, no la suma de las dos.
+        let total = first.records + second.records
+        #expect(total.reduce(0) { $0 + $1.inputTokens } == 100)
+        #expect(total.reduce(0) { $0 + $1.outputTokens } == 25)
+        #expect(total.reduce(0) { $0 + $1.cacheReadTokens } == 5_000)
+        #expect(total.reduce(0) { $0 + $1.cacheCreationTokens } == 200)
+        #expect(abs(total.reduce(0) { $0 + $1.costUSD } - 0.171) < 1e-9)
+        // El desglose por modelo también va por deltas: un solo evento, 5 325 tokens.
+        let byModel = await harness.breakdown.totalsByModel(windowDays: 30)
+        #expect(byModel == [CursorBreakdownStore.ModelTotal(model: "gpt-5.6-sol-high", tokens: 5_325)])
+        let split = await harness.breakdown.originSplit(windowDays: 30)
+        #expect(split.appEvents == 1)
+        #expect(split.appTokens == 5_325)
+
+        // Una tercera lectura sin cambios no suma nada.
+        let third = await harness.collector().collect()
+        #expect(third.status == .ok)
+        #expect(third.records.isEmpty)
+    }
+
+    @Test("un evento que solo sube en costo suma el ajuste de centavos al día y al modelo")
+    func eventoQueSoloSubeEnCosto() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        await harness.state.load()
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var cents = 10.0
+        StubURLProtocol.setHandler { _ in
+            let event = Self.eventJSON(timestampMs: now, conversationId: "conv-centavos",
+                                       input: 100, output: 10, cacheRead: 1_000, totalCents: cents)
+            return (200, Self.responseData(events: [event]))
+        }
+
+        let first = await harness.collector().collect()
+        #expect(abs(first.records.reduce(0) { $0 + $1.costUSD } - 0.10) < 1e-9)
+
+        // Mismos tokens, más centavos: el ajuste final de costo de un turno ya cerrado.
+        cents = 25.0
+        let second = await harness.collector().collect()
+        #expect(second.status == .ok)
+        StatsSupport.expectInvariant(second)
+        let delta = try #require(second.records.first)
+        #expect(delta.totalTokens == 0)
+        #expect(abs(delta.costUSD - 0.15) < 1e-9)
+        #expect(abs((second.modelRecords.first?.costUSD ?? 0) - 0.15) < 1e-9)
+        let total = (first.records + second.records).reduce(0) { $0 + $1.costUSD }
+        #expect(abs(total - 0.25) < 1e-9)
+
+        // Y no se vuelve a sumar en la siguiente lectura.
+        let third = await harness.collector().collect()
+        #expect(third.records.isEmpty)
+    }
+
+    @Test("un evento que baja en un campo no resta ni vuelve a sumar")
+    func eventoQueBajaNoResta() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        await harness.state.load()
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var output = 10
+        StubURLProtocol.setHandler { _ in
+            let event = Self.eventJSON(timestampMs: now, conversationId: "conv-baja",
+                                       input: 100, output: output, cacheRead: 1_000, totalCents: 9)
+            return (200, Self.responseData(events: [event]))
+        }
+
+        let first = await harness.collector().collect()
+        #expect(StatsSupport.total(first) == 1_110)
+
+        output = 5
+        let second = await harness.collector().collect()
+        #expect(second.status == .ok)
+        #expect(second.records.isEmpty)
+
+        // Si luego vuelve a subir por encima del máximo guardado, solo se suma ese exceso.
+        output = 12
+        let third = await harness.collector().collect()
+        #expect(StatsSupport.total(third) == 2)
+    }
+
+    @Test("las fotos sobreviven a un reinicio: tras recargar state.json solo se suma el crecimiento")
+    func fotosSobrevivenAlReinicio() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        await harness.state.load()
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var cacheRead = 1_000
+        StubURLProtocol.setHandler { _ in
+            let event = Self.eventJSON(timestampMs: now, conversationId: "conv-reinicio",
+                                       input: 100, output: 10, cacheRead: cacheRead)
+            return (200, Self.responseData(events: [event]))
+        }
+
+        let first = await harness.collector().collect()
+        #expect(StatsSupport.total(first) == 1_110)
+        await harness.state.save()
+
+        let reloadedState = CollectorStateStore(directory: harness.stateDirectory)
+        await reloadedState.load()
+        let reloadedCollector = CursorCollector(store: reloadedState, breakdown: harness.breakdown,
+                                                databaseURL: harness.databaseURL, session: harness.session)
+        cacheRead = 1_500
+        let second = await reloadedCollector.collect()
+        #expect(StatsSupport.total(second) == 500)
+    }
+
+    @Test("state.json v3: un evento ya visto como booleano no se vuelve a sumar y el estado se guarda en v4")
+    func stateV3NoVuelveASumarLoVisto() async throws {
+        let harness = try Harness()
+        defer { harness.cleanUp() }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        // Antes de v4 el collector guardaba `cursor:<conversationId>:<timestamp>` en
+        // `seenMessageIDs`. Ese evento ya se contó con su primera foto: aunque hoy traiga
+        // más tokens, no hay contra qué calcular el delta y NO debe sumarse entero otra vez.
+        let seenID = "cursor:conv-v3:\(now - 1_000)"
+        let v3 = """
+        {"version":3,"bootstrapped":["cursor"],"cursors":{},
+         "seenMessageIDs":["\(seenID)","otro-collector-1"],"claudeMessages":[],
+         "cursorLastEventTimestampMs":\(now - 1_000),
+         "codexResponseIDsBySource":{},"codexModelByPath":{},
+         "commandCodeMessageIDs":[],"openCodeFinalizedMessageIDs":[]}
+        """
+        try FileManager.default.createDirectory(at: harness.stateDirectory, withIntermediateDirectories: true)
+        let stateURL = harness.stateDirectory.appending(path: "state.json")
+        try Data(v3.utf8).write(to: stateURL)
+        await harness.state.load()
+        StubURLProtocol.setHandler { _ in
+            let visto = Self.eventJSON(timestampMs: now - 1_000, conversationId: "conv-v3",
+                                       input: 500, output: 50)
+            let nuevo = Self.eventJSON(timestampMs: now, conversationId: "conv-nuevo",
+                                       input: 7, output: 3)
+            return (200, Self.responseData(events: [visto, nuevo]))
+        }
+
+        let result = await harness.collector().collect()
+        #expect(result.status == .ok)
+        #expect(StatsSupport.total(result) == 10)
+        // El id de otro collector sigue en el dedup general.
+        #expect(await harness.state.markSeen(messageID: "otro-collector-1"))
+
+        await harness.state.save()
+        let object = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL))
+            as? [String: Any])
+        #expect(object["version"] as? Int == 4)
+        #expect(object["cursorSeenWithoutSnapshot"] as? [String] == [seenID])
+        #expect(object["seenMessageIDs"] as? [String] == ["otro-collector-1"])
+        let snapshots = try #require(object["cursorEventSnapshots"] as? [String: Any])
+        #expect(snapshots.keys.sorted() == ["cursor:conv-nuevo:\(now)"])
     }
 
     // MARK: - P2: al topar el tope de páginas, cuenta lo ya leído y no avanza la marca

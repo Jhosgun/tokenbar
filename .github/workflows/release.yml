@@ -56,7 +56,9 @@ jobs:
       - name: Publicar release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/TokenBar-${{ steps.package.outputs.version }}.zip
+          files: |
+            dist/TokenBar-${{ steps.package.outputs.version }}.zip
+            dist/TokenBar-${{ steps.package.outputs.version }}.zip.sha256
           body: |
             ## Instalar
 

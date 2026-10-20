@@ -26,6 +26,7 @@ struct LimitBarView: View {
     let window: LimitWindow
     /// Se recalcula desde fuera para que la cuenta regresiva avance sin refrescar datos.
     let now: Date
+    var isStale = false
 
     private var tint: Color {
         switch window.severity {
@@ -42,26 +43,38 @@ struct LimitBarView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 4)
-                Text("\(window.percent)%")
-                    .font(.caption.weight(.medium))
-                    .monospacedDigit()
-                    .foregroundStyle(window.severity == .normal ? .primary : tint)
+                if !window.hasReset(at: now) {
+                    Text("\(window.percent)%")
+                        .font(.caption.weight(.medium))
+                        .monospacedDigit()
+                        .foregroundStyle(window.severity == .normal ? .primary : tint)
+                }
             }
 
-            LimitBarTrack(utilization: window.utilization, tint: tint)
-                .frame(height: 5)
-
-            if let remaining = window.timeRemaining(from: now) {
-                Text("resetea en \(remaining)")
+            if window.hasReset(at: now) {
+                Text("reiniciada, sin dato nuevo")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+            } else {
+                LimitBarTrack(utilization: window.utilization, tint: tint)
+                    .frame(height: 5)
+
+                if let remaining = window.timeRemaining(from: now) {
+                    Text("resetea en \(remaining)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
+        .opacity(isStale ? 0.55 : 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityText)
     }
 
     private var accessibilityText: String {
+        if window.hasReset(at: now) {
+            return "\(window.name): reiniciada, sin dato nuevo"
+        }
         var parts = ["\(window.name): \(window.percent) por ciento usado"]
         if let remaining = window.timeRemaining(from: now) {
             parts.append("resetea en \(remaining)")
